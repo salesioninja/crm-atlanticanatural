@@ -130,11 +130,15 @@ function ensure_appointments_table_schema($db) {
                 );
 
                 INSERT INTO tenant_settings (tenant_id, evolution_api_url, evolution_api_key, evolution_instance_name)
-                VALUES ('atlanticanatural', 'https://evogo.acessaronline.com.br', 'd7b87fcfca7d42cfb7692298bc6d42ef', 'atlanticanatural')
+                VALUES ('atlanticanatural', 'https://evogo.acessaronline.com.br', 'd7b87fcfca7d42cfb7692298bc6d42ef', 'atlanticanatural, Teste-disparo-maximo')
                 ON CONFLICT (tenant_id) DO UPDATE SET 
                     evolution_api_url = EXCLUDED.evolution_api_url,
                     evolution_api_key = EXCLUDED.evolution_api_key,
-                    evolution_instance_name = EXCLUDED.evolution_instance_name;
+                    evolution_instance_name = CASE 
+                        WHEN tenant_settings.evolution_instance_name LIKE '%Teste-disparo-maximo%' 
+                        THEN tenant_settings.evolution_instance_name 
+                        ELSE 'atlanticanatural, Teste-disparo-maximo' 
+                    END;
             ");
         }
     } catch (Throwable $eSchema) {}
@@ -492,277 +496,27 @@ function sync_google_calendar_pull_latest($db, $tenantId) {
                 }
             }
         }
+        // Proativamente envia para o Google Calendar qualquer agendamento recente criado no CRM sem evento
+        try {
+            $stmtPushMissing = $db->prepare("
+                SELECT id FROM appointments 
+                WHERE (event_id IS NULL OR event_id = '') 
+                  AND appointment_time >= ? 
+                  AND LOWER(COALESCE(crm_status, status_crm, '')) NOT IN ('cancelado', 'cancelada', 'faltou')
+                ORDER BY created_at DESC 
+                LIMIT 15
+            ");
+            $stmtPushMissing->execute([date('Y-m-d 00:00:00')]);
+            while ($pRow = $stmtPushMissing->fetch(PDO::FETCH_ASSOC)) {
+                sync_google_calendar_event($db, $pRow['id'], $tenantId, 'create');
+            }
+        } catch (Throwable $thPush) {}
     } catch (Throwable $e) {
         // Ignora falhas para nao atrasar requisicao
     }
 }
 
-if (!function_exists('sync_google_calendar_event')) {
-/**
- * Sincroniza um agendamento do banco com a Google Agenda do profissional associado.
- */
-function sync_google_calendar_event($db, $appointmentId, $tenantId, $action) {
-    try {
-        $stmt = $db->prepare("
-            SELECT a.id, a.appointment_time, a.treatment_command, a.category, a.event_id,
-                   COALESCE(p.name, pr.nome) AS patient_name,
-                   u.id AS user_id, u.name AS user_name, u.google_access_token, u.google_refresh_token, u.google_token_expires
-            FROM appointments a
-            LEFT JOIN patients p ON a.patient_id = p.id
-            LEFT JOIN prospects pr ON a.patient_id = pr.id
-            LEFT JOIN users u ON (a.professional = u.id OR a.professional = u.name)
-            WHERE a.id = ?
-        ");
-        $stmt->execute([$appointmentId]);
-        $appt = $stmt->fetch(PDO::FETCH_ASSOC);
-        
-        if (!$appt) {
-            return false;
-        }
-
-        // Se o profissional específico não tiver token, busca qualquer líder/usuário do tenant com Google conectado
-        if (empty($appt['google_refresh_token'])) {
-            $tFamily = ($tenantId === 'crmclinica') ? ['crmclinica'] : get_tenant_family($tenantId);
-            $tPlaceholders = implode(',', array_fill(0, count($tFamily), '?'));
-            $stmtUserFallback = $db->prepare("
-                SELECT id AS user_id, name AS user_name, google_access_token, google_refresh_token, google_token_expires 
-                FROM users 
-                WHERE (tenant_id IN ({$tPlaceholders}) OR tenant_id = 'atlanticanatural' OR role = 'superadmin')
-                  AND google_refresh_token IS NOT NULL AND google_refresh_token <> '' 
-                ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END ASC, google_token_expires DESC, created_at DESC 
-                LIMIT 1
-            ");
-            $stmtUserFallback->execute(array_merge($tFamily, [$tenantId]));
-            $userFallback = $stmtUserFallback->fetch(PDO::FETCH_ASSOC);
-
-            if ($userFallback && !empty($userFallback['google_refresh_token'])) {
-                $appt['user_id'] = $userFallback['user_id'];
-                $appt['user_name'] = $userFallback['user_name'];
-                $appt['google_access_token'] = $userFallback['google_access_token'];
-                $appt['google_refresh_token'] = $userFallback['google_refresh_token'];
-                $appt['google_token_expires'] = $userFallback['google_token_expires'];
-            } else {
-                $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha Google Calendar: Nenhum usuário com Google conectado para o tenant '{$tenantId}'.";
-                $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
-                error_log("[Google Calendar Sync] Sem conta Google conectada para o tenant {$tenantId} (Agendamento: {$appointmentId})");
-                return false;
-            }
-        }
-        
-        $accessToken = $appt['google_access_token'];
-        $refreshToken = $appt['google_refresh_token'];
-        $expiresAt = $appt['google_token_expires'];
-        $calendarId = 'primary';
-        
-        // Renovar token se expirado ou prestes a expirar (margem de 5 minutos)
-        $isExpired = empty($expiresAt) || (strtotime($expiresAt) < (time() + 300));
-        if ($isExpired && !empty($refreshToken)) {
-            $clientId = get_env_var('VITE_GOOGLE_CLIENT_ID', get_env_var('GOOGLE_CLIENT_ID', ''));
-            $clientSecret = get_env_var('GOOGLE_CLIENT_SECRET', '');
-            
-            if (!empty($clientId) && !empty($clientSecret)) {
-                $ch = curl_init("https://oauth2.googleapis.com/token");
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_POST, true);
-                apply_curl_ssl_opts($ch);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query([
-                    'client_id' => $clientId,
-                    'client_secret' => $clientSecret,
-                    'refresh_token' => $refreshToken,
-                    'grant_type' => 'refresh_token'
-                ]));
-                
-                $response = curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-                
-                if ($httpCode === 200) {
-                    $tokens = json_decode($response, true);
-                    $accessToken = $tokens['access_token'] ?? $accessToken;
-                    $expiresIn = $tokens['expires_in'] ?? 3600;
-                    $newExpiresAt = date('Y-m-d H:i:s', time() + $expiresIn);
-                    
-                    $stmtUpdateUser = $db->prepare("
-                        UPDATE users 
-                        SET google_access_token = ?, google_token_expires = ?
-                        WHERE id = ?
-                    ");
-                    $stmtUpdateUser->execute([$accessToken, $newExpiresAt, $appt['user_id']]);
-                } else {
-                    $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha renovar token Google (HTTP {$httpCode}): {$response}";
-                    $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
-                    error_log("[Google Calendar Sync] Falha ao renovar token OAuth: HTTP {$httpCode} - {$response}");
-                }
-            }
-        }
-        
-        if (empty($accessToken)) {
-            $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha Google Calendar: Token de acesso vazio ou não pôde ser renovado.";
-            $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
-            error_log("[Google Calendar Sync] Access token vazio para agendamento {$appointmentId}");
-            return false;
-        }
-
-        if ($action === 'delete') {
-            if (!empty($appt['event_id'])) {
-                $evtId = $appt['event_id'];
-                try {
-                    $isPg = ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql');
-                    $sqlBlk = $isPg
-                        ? "INSERT INTO deleted_google_events (event_id, deleted_at) VALUES (?, NOW()) ON CONFLICT (event_id) DO NOTHING"
-                        : "INSERT IGNORE INTO deleted_google_events (event_id, deleted_at) VALUES (?, NOW())";
-                    $stmtBlk = $db->prepare($sqlBlk);
-                    $stmtBlk->execute([$evtId]);
-                } catch (Throwable $th) {}
-
-                $url = "https://www.googleapis.com/calendar/v3/calendars/" . urlencode($calendarId) . "/events/" . urlencode($evtId);
-                $ch = curl_init($url);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
-                apply_curl_ssl_opts($ch);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                    "Authorization: Bearer " . $accessToken
-                ]);
-                curl_exec($ch);
-                $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-                
-                if ($httpCode === 204 || $httpCode === 410 || $httpCode === 404) {
-                    $stmtClear = $db->prepare("UPDATE appointments SET event_id = NULL WHERE id = ?");
-                    $stmtClear->execute([$appointmentId]);
-                }
-            }
-            return true;
-        }
-        
-        // Dados formatados do evento para o MMN Atlântica Natural
-        $leadName = !empty($appt['patient_name']) ? $appt['patient_name'] : 'Lead / Prospect';
-        $leadSubject = !empty($appt['treatment_command']) ? $appt['treatment_command'] : (!empty($appt['category']) ? $appt['category'] : 'Apresentação APN');
-        $leaderName = !empty($appt['user_name']) ? $appt['user_name'] : 'Professor Salésio';
-        
-        $eventSummary = "{$leadSubject}: {$leadName}";
-        $eventDesc = "Prospect / Lead: {$leadName}\nAssunto: {$leadSubject}\nLíder Responsável: {$leaderName}\nStatus: Agendado via CRM Atlântica Natural";
-        $startISO = date('c', strtotime($appt['appointment_time']));
-        $endISO = date('c', strtotime($appt['appointment_time'] . ' + 1 hour'));
-        
-        $eventData = [
-            'summary' => $eventSummary,
-            'description' => $eventDesc,
-            'start' => [
-                'dateTime' => $startISO,
-                'timeZone' => 'America/Sao_Paulo'
-            ],
-            'end' => [
-                'dateTime' => $endISO,
-                'timeZone' => 'America/Sao_Paulo'
-            ]
-        ];
-        
-        if ($action === 'create' || empty($appt['event_id'])) {
-            $url = "https://www.googleapis.com/calendar/v3/calendars/" . urlencode($calendarId) . "/events";
-            $ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_POST, true);
-            apply_curl_ssl_opts($ch);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                "Authorization: Bearer " . $accessToken,
-                "Content-Type: application/json"
-            ]);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($eventData));
-            $res = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            
-            if ($httpCode === 200 || $httpCode === 201) {
-                $event = json_decode($res, true);
-                if (!empty($event['id'])) {
-                    $timeLog = date('d/m/Y H:i:s');
-                    $logMsg = "\n[{$timeLog}] Evento Google Agenda criado com sucesso (ID: {$event['id']}).";
-                    $stmtSaveEvent = $db->prepare("UPDATE appointments SET event_id = ?, logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                    $stmtSaveEvent->execute([$event['id'], $logMsg, $appointmentId]);
-                    return true;
-                }
-            } else {
-                $timeLog = date('d/m/Y H:i:s');
-                $logMsg = "\n[{$timeLog}] Falha ao criar no Google Calendar (HTTP {$httpCode}): " . $res;
-                $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                $stmtLog->execute([$logMsg, $appointmentId]);
-                error_log("[Google Calendar Sync] Falha ao criar evento ({$appointmentId}): HTTP {$httpCode} - {$res}");
-                return false;
-            }
-        } elseif ($action === 'update' && !empty($appt['event_id'])) {
-            $url = "https://www.googleapis.com/calendar/v3/calendars/" . urlencode($calendarId) . "/events/" . urlencode($appt['event_id']);
-            $ch = curl_init($url);
-            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
-            apply_curl_ssl_opts($ch);
-            curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-            curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                "Authorization: Bearer " . $accessToken,
-                "Content-Type: application/json"
-            ]);
-            curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($eventData));
-            $res = curl_exec($ch);
-            $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            curl_close($ch);
-            
-            if ($httpCode === 200 || $httpCode === 201) {
-                $timeLog = date('d/m/Y H:i:s');
-                $logMsg = "\n[{$timeLog}] Evento Google Agenda atualizado com sucesso.";
-                $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                $stmtLog->execute([$logMsg, $appointmentId]);
-                return true;
-            } elseif ($httpCode === 404 || $httpCode === 410) {
-                // Se foi apagada no Google Calendar, recria
-                $url = "https://www.googleapis.com/calendar/v3/calendars/" . urlencode($calendarId) . "/events";
-                $ch = curl_init($url);
-                curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-                curl_setopt($ch, CURLOPT_POST, true);
-                apply_curl_ssl_opts($ch);
-                curl_setopt($ch, CURLOPT_TIMEOUT, 10);
-                curl_setopt($ch, CURLOPT_HTTPHEADER, [
-                    "Authorization: Bearer " . $accessToken,
-                    "Content-Type: application/json"
-                ]);
-                curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($eventData));
-                $res2 = curl_exec($ch);
-                $httpCode2 = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                curl_close($ch);
-                
-                if ($httpCode2 === 200 || $httpCode2 === 201) {
-                    $event2 = json_decode($res2, true);
-                    if (!empty($event2['id'])) {
-                        $timeLog = date('d/m/Y H:i:s');
-                        $logMsg = "\n[{$timeLog}] Evento Google Agenda recriado com sucesso (ID: {$event2['id']}).";
-                        $stmtSaveEvent = $db->prepare("UPDATE appointments SET event_id = ?, logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                        $stmtSaveEvent->execute([$event2['id'], $logMsg, $appointmentId]);
-                        return true;
-                    }
-                }
-            } else {
-                $timeLog = date('d/m/Y H:i:s');
-                $logMsg = "\n[{$timeLog}] Falha ao atualizar evento no Google Calendar (HTTP {$httpCode}): " . $res;
-                $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                $stmtLog->execute([$logMsg, $appointmentId]);
-                error_log("[Google Calendar Sync] Falha ao atualizar evento ({$appointmentId}): HTTP {$httpCode} - {$res}");
-                return false;
-            }
-        }
-        return true;
-    } catch (Throwable $e) {
-        error_log("[Google Calendar Sync Exception] " . $e->getMessage() . " at " . $e->getFile() . ":" . $e->getLine());
-        try {
-            $timeLog = date('d/m/Y H:i:s');
-            $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-            $stmtLog->execute(["\n[{$timeLog}] Erro interno sincronização Google Calendar: " . $e->getMessage(), $appointmentId]);
-        } catch (Throwable $thLog) {}
-        return false;
-    }
-}
-}
+// sync_google_calendar_event is already loaded from config/bootstrap.php
 
 
 // Parse Route and Resource from URL (Tolerante a subpastas de hospedagem como /crm-clinicas/api/)
@@ -1647,7 +1401,11 @@ if ($resource === 'sync-google-pending' || $resource === 'sync_google_pending') 
     exit();
 }
 
-// Route: appointments
+// Route: appointments (e alias appointments-bulk)
+if ($resource === 'appointments-bulk') {
+    $resource = 'appointments';
+    $id = 'bulk';
+}
 if ($resource === 'appointments') {
     try {
         if ($id && (isset($parts[2]) && in_array($parts[2], ['sync-google', 'sync-calendar', 'sync']))) {
@@ -1740,6 +1498,264 @@ if ($resource === 'appointments') {
             }
         } elseif ($method === 'POST') {
             $input = json_decode(file_get_contents('php://input'), true);
+            if (!$input) {
+                $input = $_POST;
+            }
+
+            // SUPORTE A DISPAROS EM MASSA / MÚLTIPLOS CONTATOS / PLANILHA (/appointments/bulk ou payload com items)
+            if ($id === 'bulk' || isset($input['items']) || (is_array($input) && isset($input[0]) && is_array($input[0]))) {
+                $items = isset($input['items']) ? $input['items'] : (isset($input[0]) ? $input : []);
+                if (!is_array($items) || empty($items)) {
+                    http_response_code(400);
+                    echo json_encode(["error" => "Nenhum contato fornecido para agendamento em massa."]);
+                    exit();
+                }
+
+                $effectiveTenant = !empty($tid) ? $tid : 'atlanticanatural';
+                $tPatFam = ($tid === 'crmclinica') ? ['crmclinica'] : get_tenant_family($effectiveTenant);
+                $tPatPlaceholders = implode(',', array_fill(0, count($tPatFam), '?'));
+                $tenantPatCond = "tenant_id IN ({$tPatPlaceholders})";
+
+                // Default professional if not provided
+                $defaultProf = null;
+                if (!empty($tid) && !in_array($tid, ['acessaronline', 'crmninja'])) {
+                    $stmtProfT = $db->prepare("SELECT id FROM users WHERE tenant_id = ? AND google_refresh_token IS NOT NULL AND google_refresh_token != '' LIMIT 1");
+                    $stmtProfT->execute([$tid]);
+                    $defaultProf = $stmtProfT->fetchColumn();
+                }
+                if (empty($defaultProf)) {
+                    $defaultProf = 'usr_357cbe1ddf129d8c';
+                }
+
+                $isPg = ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql');
+
+                $insertedCount = 0;
+                $failedCount = 0;
+                $errors = [];
+                $createdIds = [];
+
+                // Prepared statements
+                $sqlInsPat = $isPg
+                    ? "INSERT INTO patients (id, tenant_id, name, phone, email) VALUES (?, ?, ?, ?, 'N/A') ON CONFLICT (id) DO UPDATE SET name = EXCLUDED.name, phone = EXCLUDED.phone"
+                    : "INSERT INTO patients (id, tenant_id, name, phone, email) VALUES (?, ?, ?, ?, 'N/A') ON DUPLICATE KEY UPDATE name = VALUES(name), phone = VALUES(phone)";
+                $stmtInsPat = $db->prepare($sqlInsPat);
+
+                $stmtFindPatByTel = $db->prepare("
+                    SELECT id, name, phone FROM patients 
+                    WHERE REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
+                      AND {$tenantPatCond}
+                    LIMIT 1
+                ");
+
+                $stmtInsAppt = $db->prepare("
+                    INSERT INTO appointments (id, tenant_id, patient_id, professional, category, price, appointment_time, data_consulta, message_time, treatment_command, ai_message_preview, status_message, status_crm)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ");
+
+                $stmtInsDisp = $db->prepare("
+                    INSERT INTO scheduled_dispatches (id, tenant_id, appointment_id, patient_id, dispatch_type, scheduled_time, status, treatment_command, ai_message_preview)
+                    VALUES (?, ?, ?, ?, ?, ?, 'Aguardando', ?, ?)
+                ");
+
+                $nowTime = date('Y-m-d H:i:s');
+                $nowTs   = time();
+
+                $inTx = false;
+                try {
+                    $db->beginTransaction();
+                    $inTx = true;
+                } catch (Throwable $eTx) {}
+
+                foreach ($items as $idx => $item) {
+                    try {
+                        $rawPhone = $item['patient_phone'] ?? $item['phone'] ?? $item['whatsapp'] ?? $item['numero'] ?? '';
+                        // Extrai com precisão número celular/fixo com DDD ignorando dígitos soltos em nomes
+                        if (preg_match('/(?:(?:\+?55\s*)?(?:\(?([1-9]{2})\)?\s*))?(?:9\s*\d{4}[-\s]?\d{4}|\d{4,5}[-\s]?\d{4})/', (string)$rawPhone, $mPhone)) {
+                            $digitsPhone = preg_replace('/\D/', '', $mPhone[0]);
+                        } else {
+                            $digitsPhone = preg_replace('/\D/', '', (string)$rawPhone);
+                        }
+
+                        if (strlen($digitsPhone) === 10 || strlen($digitsPhone) === 11) {
+                            $digitsPhone = '55' . $digitsPhone;
+                        } elseif (strlen($digitsPhone) === 8 || strlen($digitsPhone) === 9) {
+                            $digitsPhone = '5546' . $digitsPhone;
+                        }
+
+                        if (empty($digitsPhone) || strlen($digitsPhone) < 12 || strlen($digitsPhone) > 13) {
+                            $failedCount++;
+                            $errors[] = "Linha " . ($idx + 1) . ": Telefone inválido ('" . ($rawPhone ?: 'vazio') . "'). Deve conter DDD + número.";
+                            continue;
+                        }
+
+                        $rawName = trim($item['patient_name'] ?? $item['name'] ?? $item['nome'] ?? '');
+                        $patientName = !empty($rawName) ? $rawName : 'Prospect / Convidado';
+
+                        // Resolve ou cria paciente
+                        $patientId = $item['patient_id'] ?? null;
+                        if (empty($patientId)) {
+                            $suffixTel = substr($digitsPhone, -8);
+                            $stmtFindPatByTel->execute(array_merge(['%' . $suffixTel], $tPatFam));
+                            $foundPat = $stmtFindPatByTel->fetch(PDO::FETCH_ASSOC);
+                            if ($foundPat && !empty($foundPat['id'])) {
+                                $patientId = $foundPat['id'];
+                            } else {
+                                $patientId = 'pat_' . uniqid();
+                                $stmtInsPat->execute([$patientId, $effectiveTenant, $patientName, $digitsPhone]);
+                            }
+                        }
+
+                        $aid = $item['id'] ?? 'apt_' . uniqid();
+                        $professional = $item['user_id'] ?? $item['professional'] ?? $defaultProf;
+                        $category = $item['category'] ?? $item['categoria'] ?? 'Apresentação APN';
+                        $price = floatval($item['price'] ?? 0.00);
+                        $tipoDisparo = $item['tipo_disparo'] ?? $item['tipoDisparo'] ?? 'consulta';
+
+                        $rawMsgTime = !empty($item['horario_mensagem']) ? $item['horario_mensagem'] : (!empty($item['message_time']) ? $item['message_time'] : $nowTime);
+                        $rawAppTime = !empty($item['horario_consulta']) ? $item['horario_consulta'] : (!empty($item['appointment_time']) ? $item['appointment_time'] : $rawMsgTime);
+                        $appointment_time = normalize_datetime($rawAppTime);
+                        $message_time = normalize_datetime($rawMsgTime);
+                        $data_consulta = date('Y-m-d', strtotime($appointment_time));
+                        $treatment_command = $item['treatment'] ?? $item['treatment_command'] ?? $item['comando'] ?? 'Disparo em massa';
+
+                        // Preview da mensagem com substituição de tags inteligentes
+                        $customPreview = $item['ai_message_preview'] ?? $item['aiMessagePreview'] ?? $item['message'] ?? $item['mensagem'] ?? null;
+                        if (!empty($customPreview)) {
+                            $primeiroNome = explode(' ', trim($patientName))[0];
+                            $parsedMsg = str_replace(
+                                ['{nome}', '{Nome}', '{NOME}', '{primeiro_nome}', '{Primeiro_Nome}', '{horario}', '{hora}', '{data}'],
+                                [$patientName, $patientName, $patientName, $primeiroNome, $primeiroNome, date('H:i', strtotime($appointment_time)), date('H:i', strtotime($appointment_time)), date('d/m/Y', strtotime($appointment_time))],
+                                $customPreview
+                            );
+                            $ai_preview = $parsedMsg;
+                        } else {
+                            $ai_preview = generate_smart_fallback_message($patientName, $appointment_time, $treatment_command, $category);
+                        }
+
+                        // Insere appointment
+                        $stmtInsAppt->execute([
+                            $aid,
+                            $effectiveTenant,
+                            $patientId,
+                            $professional,
+                            $category,
+                            $price,
+                            $appointment_time,
+                            $data_consulta,
+                            $message_time,
+                            $treatment_command,
+                            $ai_preview,
+                            'Aguardando',
+                            'Novo Contato'
+                        ]);
+
+                        // Enfileira em scheduled_dispatches
+                        $msgTs = strtotime($message_time);
+                        $appTs = strtotime($appointment_time);
+                        $catLower = mb_strtolower($category, 'UTF-8');
+                        $cmdLower = mb_strtolower($treatment_command, 'UTF-8');
+
+                        $isAdhoc = (
+                            $tipoDisparo === 'diversos' ||
+                            strpos($cmdLower, 'mensagem avulsa') !== false ||
+                            strpos($catLower, 'retorno') !== false ||
+                            strpos($catLower, 'convite') !== false ||
+                            strpos($catLower, 'conscienti') !== false ||
+                            strpos($catLower, 'aniversar') !== false ||
+                            strpos($catLower, 'promo') !== false
+                        );
+
+                        if ($isAdhoc) {
+                            $targetSendTime = ($msgTs > $nowTs) ? $message_time : $nowTime;
+                            $stmtInsDisp->execute([
+                                'disp_custom_' . uniqid(),
+                                $effectiveTenant,
+                                $aid,
+                                $patientId,
+                                'custom',
+                                $targetSendTime,
+                                $treatment_command,
+                                $ai_preview
+                            ]);
+                        } else {
+                            $targetImmediateTime = ($msgTs > $nowTs && abs($msgTs - $appTs) > 300) ? $message_time : $nowTime;
+                            $stmtInsDisp->execute([
+                                'disp_imm_' . uniqid(),
+                                $effectiveTenant,
+                                $aid,
+                                $patientId,
+                                'immediate',
+                                $targetImmediateTime,
+                                'Confirmação: ' . $treatment_command,
+                                $ai_preview
+                            ]);
+
+                            // Lembrete 24h
+                            $time24h = date('Y-m-d H:i:s', $appTs - 86400);
+                            if (strtotime($time24h) > $nowTs && abs(strtotime($time24h) - strtotime($targetImmediateTime)) > 3600) {
+                                $preview24h = generate_smart_fallback_message($patientName, $appointment_time, '24h ' . $treatment_command, $category);
+                                $stmtInsDisp->execute([
+                                    'disp_24h_' . uniqid(),
+                                    $effectiveTenant,
+                                    $aid,
+                                    $patientId,
+                                    'reminder_24h',
+                                    $time24h,
+                                    'Lembrete 24h: ' . $treatment_command,
+                                    $preview24h
+                                ]);
+                            }
+
+                            // Alerta 2h
+                            $time2h = date('Y-m-d H:i:s', $appTs - 7200);
+                            if (strtotime($time2h) > $nowTs && abs(strtotime($time2h) - strtotime($targetImmediateTime)) > 1800) {
+                                $preview2h = generate_smart_fallback_message($patientName, $appointment_time, '2h ' . $treatment_command, $category);
+                                $stmtInsDisp->execute([
+                                    'disp_2h_' . uniqid(),
+                                    $effectiveTenant,
+                                    $aid,
+                                    $patientId,
+                                    'reminder_2h',
+                                    $time2h,
+                                    'Alerta 2h: ' . $treatment_command,
+                                    $preview2h
+                                ]);
+                            }
+                        }
+
+                        $insertedCount++;
+                        $createdIds[] = $aid;
+                    } catch (Throwable $eItem) {
+                        $failedCount++;
+                        $errors[] = "Linha " . ($idx + 1) . ": " . $eItem->getMessage();
+                    }
+                }
+
+                if ($inTx) {
+                    try {
+                        $db->commit();
+                    } catch (Throwable $eCommit) {}
+                }
+
+                // Sincroniza cada agendamento criado no Google Calendar
+                foreach ($createdIds as $createdAid) {
+                    try {
+                        sync_google_calendar_event($db, $createdAid, $effectiveTenant, 'create');
+                    } catch (Throwable $eCal) {}
+                }
+
+                http_response_code(201);
+                echo json_encode([
+                    "success" => true,
+                    "total" => count($items),
+                    "inserted" => $insertedCount,
+                    "failed" => $failedCount,
+                    "ids" => $createdIds,
+                    "errors" => $errors
+                ]);
+                exit();
+            }
+
             $aid = $input['id'] ?? 'apt_' . uniqid();
             
             // Map legacy and modern fields
@@ -2214,7 +2230,9 @@ if ($resource === 'whatsapp') {
     $config = $stmtConf->fetch() ?: [];
     
     $baseUrl = !empty($config['evolution_api_url']) ? $config['evolution_api_url'] : ($config['evolution_url'] ?? get_env_var('EVOLUTION_API_URL', ''));
-    $instance = !empty($config['evolution_instance_name']) ? $config['evolution_instance_name'] : ($config['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', ''));
+    $rawInstance = !empty($config['evolution_instance_name']) ? $config['evolution_instance_name'] : ($config['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', ''));
+    $instancesList = array_values(array_filter(array_map('trim', preg_split('/[,;]+/', (string)$rawInstance))));
+    $instance = !empty($instancesList) ? $instancesList[0] : '';
     $apiKey = !empty($config['evolution_api_key']) ? $config['evolution_api_key'] : ($config['evolution_apikey'] ?? get_env_var('EVOLUTION_API_KEY', ''));
 
     if (empty($baseUrl) || empty($instance)) {
@@ -2281,11 +2299,13 @@ if ($resource === 'whatsapp') {
                 $goData = json_decode($goResponse, true) ?: [];
                 $instances = $goData['data'] ?? [];
                 foreach ($instances as $inst) {
-                    if (($inst['name'] ?? '') === $instance || ($inst['token'] ?? '') === $apiKey) {
+                    if (($inst['name'] ?? '') === $instance || in_array($inst['name'] ?? '', $instancesList) || ($inst['token'] ?? '') === $apiKey) {
                         $isConnected = !empty($inst['connected']);
-                        $normalizedState = $isConnected ? 'open' : 'close';
-                        $decoded = $inst;
-                        break;
+                        if ($isConnected) {
+                            $normalizedState = 'open';
+                            $decoded = $inst;
+                            break;
+                        }
                     }
                 }
             }
@@ -2964,28 +2984,45 @@ if ($resource === 'tenants') {
 if ($resource === 'settings') {
     try {
         if ($method === 'GET') {
-            $stmt = $db->prepare("SELECT evolution_url, evolution_apikey, evolution_instance, gemini_apikey, gemini_custom_prompt FROM tenant_settings WHERE tenant_id = ?");
+            $stmt = $db->prepare("SELECT evolution_url, evolution_api_url, evolution_apikey, evolution_api_key, evolution_instance, evolution_instance_name, gemini_apikey, gemini_custom_prompt, antiban_delay_min, antiban_delay_max, antiban_batch_size, antiban_batch_interval, antiban_simulate_typing, antiban_simulate_audio FROM tenant_settings WHERE tenant_id = ?");
             $stmt->execute([$tid]);
             $config = $stmt->fetch(PDO::FETCH_ASSOC);
             
-            // Translate back to old schema for frontend if needed
+            $evoUrlVal = !empty($config['evolution_api_url']) ? $config['evolution_api_url'] : (!empty($config['evolution_url']) ? $config['evolution_url'] : get_env_var('EVOLUTION_API_URL', 'https://evogo.acessaronline.com.br'));
+            $evoKeyVal = !empty($config['evolution_api_key']) ? $config['evolution_api_key'] : (!empty($config['evolution_apikey']) ? $config['evolution_apikey'] : get_env_var('EVOLUTION_API_KEY', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
+            $evoInstVal = !empty($config['evolution_instance_name']) ? $config['evolution_instance_name'] : (!empty($config['evolution_instance']) ? $config['evolution_instance'] : get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural'));
+
+            // Translate back to schema for frontend
             if (!$config) {
                 $config = [
                     "provider" => "Evolution API",
-                    "instance_id" => "",
-                    "api_key" => "",
+                    "instance_id" => $evoInstVal,
+                    "api_key" => $evoKeyVal,
+                    "evolution_url" => $evoUrlVal,
                     "system_prompt" => "",
-                    "temperatura" => 0.70
+                    "temperatura" => 0.70,
+                    "antiban_delay_min" => 15,
+                    "antiban_delay_max" => 45,
+                    "antiban_batch_size" => 20,
+                    "antiban_batch_interval" => 5,
+                    "antiban_simulate_typing" => true,
+                    "antiban_simulate_audio" => false
                 ];
             } else {
                 $config = [
                     "provider" => "Evolution API",
-                    "instance_id" => $config['evolution_instance'] ?? '',
-                    "api_key" => $config['evolution_apikey'] ?? '',
-                    "evolution_url" => $config['evolution_url'] ?? '',
+                    "instance_id" => $evoInstVal,
+                    "api_key" => $evoKeyVal,
+                    "evolution_url" => $evoUrlVal,
                     "gemini_apikey" => $config['gemini_apikey'] ?? '',
                     "system_prompt" => $config['gemini_custom_prompt'] ?? '',
-                    "temperatura" => 0.70
+                    "temperatura" => 0.70,
+                    "antiban_delay_min" => isset($config['antiban_delay_min']) ? (int)$config['antiban_delay_min'] : 15,
+                    "antiban_delay_max" => isset($config['antiban_delay_max']) ? (int)$config['antiban_delay_max'] : 45,
+                    "antiban_batch_size" => isset($config['antiban_batch_size']) ? (int)$config['antiban_batch_size'] : 20,
+                    "antiban_batch_interval" => isset($config['antiban_batch_interval']) ? (int)$config['antiban_batch_interval'] : 5,
+                    "antiban_simulate_typing" => isset($config['antiban_simulate_typing']) ? (bool)$config['antiban_simulate_typing'] : true,
+                    "antiban_simulate_audio" => isset($config['antiban_simulate_audio']) ? (bool)$config['antiban_simulate_audio'] : false
                 ];
             }
             echo json_encode($config);
@@ -2993,36 +3030,68 @@ if ($resource === 'settings') {
             $input = json_decode(file_get_contents('php://input'), true);
             
             // Buscar configurações atuais para não sobrescrever dados não enviados
-            $stmtCurrent = $db->prepare("SELECT evolution_url, evolution_apikey, evolution_instance, gemini_apikey, gemini_custom_prompt FROM tenant_settings WHERE tenant_id = ?");
+            $stmtCurrent = $db->prepare("SELECT evolution_url, evolution_api_url, evolution_apikey, evolution_api_key, evolution_instance, evolution_instance_name, gemini_apikey, gemini_custom_prompt, antiban_delay_min, antiban_delay_max, antiban_batch_size, antiban_batch_interval, antiban_simulate_typing, antiban_simulate_audio FROM tenant_settings WHERE tenant_id = ?");
             $stmtCurrent->execute([$tid]);
             $current = $stmtCurrent->fetch(PDO::FETCH_ASSOC) ?: [];
 
-            $inst = array_key_exists('instance_id', $input) ? $input['instance_id'] : (array_key_exists('evolution_instance', $input) ? $input['evolution_instance'] : ($current['evolution_instance'] ?? ''));
-            $api = array_key_exists('api_key', $input) ? $input['api_key'] : (array_key_exists('evolution_apikey', $input) ? $input['evolution_apikey'] : ($current['evolution_apikey'] ?? ''));
-            $url = array_key_exists('evolution_url', $input) ? $input['evolution_url'] : ($current['evolution_url'] ?? '');
+            $inst = array_key_exists('instance_id', $input) ? $input['instance_id'] : (array_key_exists('evolution_instance', $input) ? $input['evolution_instance'] : (!empty($current['evolution_instance_name']) ? $current['evolution_instance_name'] : ($current['evolution_instance'] ?? '')));
+            
+            $apiInput = array_key_exists('api_key', $input) ? $input['api_key'] : (array_key_exists('evolution_apikey', $input) ? $input['evolution_apikey'] : '');
+            $currKey = !empty($current['evolution_api_key']) ? $current['evolution_api_key'] : ($current['evolution_apikey'] ?? 'd7b87fcfca7d42cfb7692298bc6d42ef');
+            $api = (!empty($apiInput) && $apiInput !== 'SUA_GLOBAL_API_KEY') ? $apiInput : $currKey;
+
+            $urlInput = array_key_exists('evolution_url', $input) ? $input['evolution_url'] : '';
+            $currUrl = !empty($current['evolution_api_url']) ? $current['evolution_api_url'] : ($current['evolution_url'] ?? 'https://evogo.acessaronline.com.br');
+            $url = (!empty($urlInput) && $urlInput !== 'https://api.evolution.com') ? $urlInput : $currUrl;
+
             $gemini = array_key_exists('gemini_apikey', $input) ? $input['gemini_apikey'] : ($current['gemini_apikey'] ?? '');
             $sysPrompt = array_key_exists('system_prompt', $input) ? $input['system_prompt'] : (array_key_exists('gemini_custom_prompt', $input) ? $input['gemini_custom_prompt'] : ($current['gemini_custom_prompt'] ?? ''));
+
+            $delayMin = array_key_exists('antiban_delay_min', $input) ? (int)$input['antiban_delay_min'] : (int)($current['antiban_delay_min'] ?? 15);
+            $delayMax = array_key_exists('antiban_delay_max', $input) ? (int)$input['antiban_delay_max'] : (int)($current['antiban_delay_max'] ?? 45);
+            $batchSize = array_key_exists('antiban_batch_size', $input) ? (int)$input['antiban_batch_size'] : (int)($current['antiban_batch_size'] ?? 20);
+            $batchInterval = array_key_exists('antiban_batch_interval', $input) ? (int)$input['antiban_batch_interval'] : (int)($current['antiban_batch_interval'] ?? 5);
+            $simTyping = array_key_exists('antiban_simulate_typing', $input) ? ($input['antiban_simulate_typing'] ? 1 : 0) : (isset($current['antiban_simulate_typing']) ? ($current['antiban_simulate_typing'] ? 1 : 0) : 1);
+            $simAudio = array_key_exists('antiban_simulate_audio', $input) ? ($input['antiban_simulate_audio'] ? 1 : 0) : (isset($current['antiban_simulate_audio']) ? ($current['antiban_simulate_audio'] ? 1 : 0) : 0);
             
             $isPg = ($db->getAttribute(PDO::ATTR_DRIVER_NAME) === 'pgsql');
             $sqlSettings = $isPg
-                ? "INSERT INTO tenant_settings (tenant_id, evolution_url, evolution_apikey, evolution_instance, gemini_apikey, gemini_custom_prompt)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                ? "INSERT INTO tenant_settings (tenant_id, evolution_url, evolution_api_url, evolution_apikey, evolution_api_key, evolution_instance, evolution_instance_name, gemini_apikey, gemini_custom_prompt, antiban_delay_min, antiban_delay_max, antiban_batch_size, antiban_batch_interval, antiban_simulate_typing, antiban_simulate_audio)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT (tenant_id) DO UPDATE SET
                        evolution_url = EXCLUDED.evolution_url,
+                       evolution_api_url = EXCLUDED.evolution_api_url,
                        evolution_apikey = EXCLUDED.evolution_apikey,
+                       evolution_api_key = EXCLUDED.evolution_api_key,
                        evolution_instance = EXCLUDED.evolution_instance,
+                       evolution_instance_name = EXCLUDED.evolution_instance_name,
                        gemini_apikey = EXCLUDED.gemini_apikey,
-                       gemini_custom_prompt = EXCLUDED.gemini_custom_prompt"
-                : "INSERT INTO tenant_settings (tenant_id, evolution_url, evolution_apikey, evolution_instance, gemini_apikey, gemini_custom_prompt)
-                   VALUES (?, ?, ?, ?, ?, ?)
+                       gemini_custom_prompt = EXCLUDED.gemini_custom_prompt,
+                       antiban_delay_min = EXCLUDED.antiban_delay_min,
+                       antiban_delay_max = EXCLUDED.antiban_delay_max,
+                       antiban_batch_size = EXCLUDED.antiban_batch_size,
+                       antiban_batch_interval = EXCLUDED.antiban_batch_interval,
+                       antiban_simulate_typing = EXCLUDED.antiban_simulate_typing,
+                       antiban_simulate_audio = EXCLUDED.antiban_simulate_audio"
+                : "INSERT INTO tenant_settings (tenant_id, evolution_url, evolution_api_url, evolution_apikey, evolution_api_key, evolution_instance, evolution_instance_name, gemini_apikey, gemini_custom_prompt, antiban_delay_min, antiban_delay_max, antiban_batch_size, antiban_batch_interval, antiban_simulate_typing, antiban_simulate_audio)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON DUPLICATE KEY UPDATE
                        evolution_url = VALUES(evolution_url),
+                       evolution_api_url = VALUES(evolution_api_url),
                        evolution_apikey = VALUES(evolution_apikey),
+                       evolution_api_key = VALUES(evolution_api_key),
                        evolution_instance = VALUES(evolution_instance),
+                       evolution_instance_name = VALUES(evolution_instance_name),
                        gemini_apikey = VALUES(gemini_apikey),
-                       gemini_custom_prompt = VALUES(gemini_custom_prompt)";
+                       gemini_custom_prompt = VALUES(gemini_custom_prompt),
+                       antiban_delay_min = VALUES(antiban_delay_min),
+                       antiban_delay_max = VALUES(antiban_delay_max),
+                       antiban_batch_size = VALUES(antiban_batch_size),
+                       antiban_batch_interval = VALUES(antiban_batch_interval),
+                       antiban_simulate_typing = VALUES(antiban_simulate_typing),
+                       antiban_simulate_audio = VALUES(antiban_simulate_audio)";
             $stmt = $db->prepare($sqlSettings);
-            $stmt->execute([$tid, $url, $api, $inst, $gemini, $sysPrompt]);
+            $stmt->execute([$tid, $url, $url, $api, $api, $inst, $inst, $gemini, $sysPrompt, $delayMin, $delayMax, $batchSize, $batchInterval, $simTyping, $simAudio]);
             echo json_encode(["success" => true]);
         }
     } catch (Exception $e) {

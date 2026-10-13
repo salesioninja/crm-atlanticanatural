@@ -11,12 +11,16 @@ import {
   Loader2, 
   AlertCircle, 
   Shield, 
+  ShieldCheck,
   Save, 
   Bot, 
   Terminal, 
   Globe, 
   Key, 
-  Zap 
+  Zap,
+  Clock,
+  Sliders,
+  Sparkles
 } from 'lucide-react';
 import api from '../lib/api';
 
@@ -39,6 +43,14 @@ export const Settings: React.FC = () => {
   const [apiKey, setApiKey] = useState('');
   const [evolutionUrl, setEvolutionUrl] = useState('');
   const [geminiApiKey, setGeminiApiKey] = useState('');
+
+  // Estados Anti-Ban e Temporização Humanizada
+  const [antibanDelayMin, setAntibanDelayMin] = useState<number>(15);
+  const [antibanDelayMax, setAntibanDelayMax] = useState<number>(45);
+  const [antibanBatchSize, setAntibanBatchSize] = useState<number>(20);
+  const [antibanBatchInterval, setAntibanBatchInterval] = useState<number>(5);
+  const [antibanSimulateTyping, setAntibanSimulateTyping] = useState<boolean>(true);
+  const [antibanSimulateAudio, setAntibanSimulateAudio] = useState<boolean>(false);
   
   const [isSaving, setIsSaving] = useState(false);
   const [showToast, setShowToast] = useState<{ message: string; type: 'success' | 'error' } | null>(null);
@@ -63,6 +75,12 @@ export const Settings: React.FC = () => {
           setApiKey(res.data.api_key || '');
           setEvolutionUrl(res.data.evolution_url || '');
           setGeminiApiKey(res.data.gemini_apikey || '');
+          if (res.data.antiban_delay_min !== undefined) setAntibanDelayMin(Number(res.data.antiban_delay_min));
+          if (res.data.antiban_delay_max !== undefined) setAntibanDelayMax(Number(res.data.antiban_delay_max));
+          if (res.data.antiban_batch_size !== undefined) setAntibanBatchSize(Number(res.data.antiban_batch_size));
+          if (res.data.antiban_batch_interval !== undefined) setAntibanBatchInterval(Number(res.data.antiban_batch_interval));
+          if (res.data.antiban_simulate_typing !== undefined) setAntibanSimulateTyping(Boolean(res.data.antiban_simulate_typing));
+          if (res.data.antiban_simulate_audio !== undefined) setAntibanSimulateAudio(Boolean(res.data.antiban_simulate_audio));
         }
       } catch (err) {
         console.error("Erro ao carregar configurações do servidor:", err);
@@ -174,7 +192,13 @@ export const Settings: React.FC = () => {
         instance_id: instanceId,
         api_key: apiKey,
         evolution_url: evolutionUrl,
-        gemini_apikey: geminiApiKey
+        gemini_apikey: geminiApiKey,
+        antiban_delay_min: Number(antibanDelayMin) || 15,
+        antiban_delay_max: Number(antibanDelayMax) || 45,
+        antiban_batch_size: Number(antibanBatchSize) || 20,
+        antiban_batch_interval: Number(antibanBatchInterval) || 5,
+        antiban_simulate_typing: antibanSimulateTyping,
+        antiban_simulate_audio: antibanSimulateAudio
       });
       triggerNotification('Configurações salvas com sucesso!', 'success');
       checkStatus();
@@ -388,6 +412,208 @@ export const Settings: React.FC = () => {
               </div>
             </div>
           </div>
+
+          {/* Card Anti-Ban & Temporização Humanizada (Ninja Engine) */}
+          <div className="glass-card rounded-[32px] p-6 sm:p-8 border-white/10 space-y-6 bg-slate-950/70 backdrop-blur-xl">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 border-b border-white/10 pb-5">
+              <div className="flex items-center gap-3">
+                <div className="w-12 h-12 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 flex items-center justify-center text-emerald-400">
+                  <ShieldCheck size={24} />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <h3 className="font-extrabold text-white text-lg">Parâmetros Anti-Ban & Disparo Seguro</h3>
+                    <span className="px-2.5 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                      Ninja Engine
+                    </span>
+                  </div>
+                  <p className="text-xs text-white/40 mt-0.5">
+                    Intervalos pseudo-aleatórios e simulação de presença humana para blindar seus chips de WhatsApp.
+                  </p>
+                </div>
+              </div>
+
+              {/* Status do Risco Dinâmico */}
+              <div className="flex items-center gap-2 px-3.5 py-1.5 rounded-xl bg-white/5 border border-white/10">
+                <span className="text-[10px] font-bold text-white/50 uppercase tracking-widest">Nível de Risco:</span>
+                <span className={`text-xs font-black uppercase tracking-wider ${
+                  antibanDelayMin < 10 
+                    ? 'text-rose-400' 
+                    : antibanDelayMin < 20 
+                    ? 'text-amber-400' 
+                    : 'text-emerald-400'
+                }`}>
+                  {antibanDelayMin < 10 ? 'Alto (Atenção)' : antibanDelayMin < 20 ? 'Moderado' : 'Mínimo / Seguro'}
+                </span>
+              </div>
+            </div>
+
+            {/* Barra Visual de Medidor de Risco */}
+            <div className="space-y-1.5">
+              <div className="flex justify-between text-[10px] text-white/40 font-bold uppercase tracking-wider">
+                <span>Indicador de Segurança de Tráfego</span>
+                <span>{antibanDelayMin}s mínimo sorteado por mensagem</span>
+              </div>
+              <div className="h-2 w-full bg-white/5 rounded-full overflow-hidden p-0.5 border border-white/5">
+                <div 
+                  className={`h-full rounded-full transition-all duration-500 ${
+                    antibanDelayMin < 10 
+                      ? 'w-1/4 bg-rose-500' 
+                      : antibanDelayMin < 20 
+                      ? 'w-3/5 bg-amber-400' 
+                      : 'w-full bg-emerald-400'
+                  }`}
+                />
+              </div>
+            </div>
+
+            {/* Configuração de Intervalos Pseudo-Aleatórios */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
+              <div className="space-y-2 bg-white/5 p-4 rounded-2xl border border-white/5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] text-white/50 font-bold uppercase tracking-widest flex items-center gap-1.5">
+                    <Clock size={12} className="text-emerald-400" /> Intervalo Mínimo (Segundos)
+                  </label>
+                  <span className="text-xs font-mono font-bold text-emerald-400">{antibanDelayMin}s</span>
+                </div>
+                <input
+                  type="range"
+                  min="5"
+                  max="60"
+                  step="1"
+                  value={antibanDelayMin}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value) || 5;
+                    setAntibanDelayMin(val);
+                    if (val > antibanDelayMax) setAntibanDelayMax(val + 5);
+                  }}
+                  className="w-full accent-emerald-400 cursor-pointer"
+                />
+                <p className="text-[10px] text-white/30">Tempo mínimo de espera antes do próximo envio.</p>
+              </div>
+
+              <div className="space-y-2 bg-white/5 p-4 rounded-2xl border border-white/5">
+                <div className="flex items-center justify-between">
+                  <label className="text-[10px] text-white/50 font-bold uppercase tracking-widest flex items-center gap-1.5">
+                    <Clock size={12} className="text-emerald-400" /> Intervalo Máximo (Segundos)
+                  </label>
+                  <span className="text-xs font-mono font-bold text-emerald-400">{antibanDelayMax}s</span>
+                </div>
+                <input
+                  type="range"
+                  min="10"
+                  max="120"
+                  step="1"
+                  value={antibanDelayMax}
+                  onChange={(e) => {
+                    const val = parseInt(e.target.value) || 15;
+                    setAntibanDelayMax(val);
+                    if (val < antibanDelayMin) setAntibanDelayMin(val);
+                  }}
+                  className="w-full accent-emerald-400 cursor-pointer"
+                />
+                <p className="text-[10px] text-white/30">O motor sorteia um valor randômico entre Mín e Máx.</p>
+              </div>
+            </div>
+
+            {/* Envio em Blocos / Lotes (Batching) */}
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+              <div className="space-y-2 bg-white/5 p-4 rounded-2xl border border-white/5">
+                <label className="text-[10px] text-white/50 font-bold uppercase tracking-widest flex items-center gap-1.5">
+                  <Sliders size={12} className="text-indigo-400" /> Quantidade por Bloco
+                </label>
+                <input
+                  type="number"
+                  min="5"
+                  max="500"
+                  value={antibanBatchSize}
+                  onChange={(e) => setAntibanBatchSize(parseInt(e.target.value) || 20)}
+                  className="w-full bg-slate-900/80 border border-white/10 rounded-xl py-2.5 px-3 text-xs text-white outline-none focus:ring-2 focus:ring-emerald-500/30"
+                />
+                <p className="text-[10px] text-white/30">Quantidade de mensagens disparadas antes de pausar.</p>
+              </div>
+
+              <div className="space-y-2 bg-white/5 p-4 rounded-2xl border border-white/5">
+                <label className="text-[10px] text-white/50 font-bold uppercase tracking-widest flex items-center gap-1.5">
+                  <Clock size={12} className="text-indigo-400" /> Pausa do Bloco (Minutos)
+                </label>
+                <input
+                  type="number"
+                  min="1"
+                  max="60"
+                  value={antibanBatchInterval}
+                  onChange={(e) => setAntibanBatchInterval(parseInt(e.target.value) || 5)}
+                  className="w-full bg-slate-900/80 border border-white/10 rounded-xl py-2.5 px-3 text-xs text-white outline-none focus:ring-2 focus:ring-emerald-500/30"
+                />
+                <p className="text-[10px] text-white/30">Descanso entre os blocos para quebrar padrões robóticos.</p>
+              </div>
+            </div>
+
+            {/* Simulação de Comportamento Humano */}
+            <div className="pt-2 border-t border-white/10 space-y-3">
+              <span className="text-[10px] font-bold text-white/40 uppercase tracking-widest block">
+                Simulação de Comportamento Humano (Evolution API)
+              </span>
+
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                <div 
+                  onClick={() => setAntibanSimulateTyping(!antibanSimulateTyping)}
+                  className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between ${
+                    antibanSimulateTyping 
+                      ? 'bg-emerald-500/10 border-emerald-500/30 text-white' 
+                      : 'bg-white/5 border-white/5 text-white/50'
+                  }`}
+                >
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <Sparkles size={13} className={antibanSimulateTyping ? 'text-emerald-400' : 'text-white/30'} />
+                      Simular Digitação
+                    </p>
+                    <p className="text-[10px] text-white/40">Exibe "Digitando..." por 2 a 3s antes do envio.</p>
+                  </div>
+                  <div className={`w-10 h-5 rounded-full transition-colors relative ${
+                    antibanSimulateTyping ? 'bg-emerald-500' : 'bg-slate-800'
+                  }`}>
+                    <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-all ${
+                      antibanSimulateTyping ? 'right-1' : 'left-1'
+                    }`} />
+                  </div>
+                </div>
+
+                <div 
+                  onClick={() => setAntibanSimulateAudio(!antibanSimulateAudio)}
+                  className={`p-4 rounded-2xl border transition-all cursor-pointer flex items-center justify-between ${
+                    antibanSimulateAudio 
+                      ? 'bg-indigo-500/10 border-indigo-500/30 text-white' 
+                      : 'bg-white/5 border-white/5 text-white/50'
+                  }`}
+                >
+                  <div className="space-y-0.5">
+                    <p className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <Zap size={13} className={antibanSimulateAudio ? 'text-indigo-400' : 'text-white/30'} />
+                      Simular Áudio
+                    </p>
+                    <p className="text-[10px] text-white/40">Exibe "Gravando áudio..." para mensagens de voz.</p>
+                  </div>
+                  <div className={`w-10 h-5 rounded-full transition-colors relative ${
+                    antibanSimulateAudio ? 'bg-indigo-500' : 'bg-slate-800'
+                  }`}>
+                    <div className={`w-3.5 h-3.5 rounded-full bg-white absolute top-0.5 transition-all ${
+                      antibanSimulateAudio ? 'right-1' : 'left-1'
+                    }`} />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            {/* Aviso de Modo de Testes Sem Trava de Horário */}
+            <div className="p-3.5 rounded-2xl bg-emerald-500/5 border border-emerald-500/15 flex items-center gap-2.5 text-[11px] text-emerald-300">
+              <CheckCircle2 size={16} className="text-emerald-400 shrink-0" />
+              <span>
+                <strong>Modo de Testes 24h Liberado:</strong> O sistema realiza os disparos em qualquer horário conforme agendado, permitindo validar o funcionamento de dia ou de noite.
+              </span>
+            </div>
+          </div>
         </div>
 
         {/* Coluna Lateral: Credenciais do Provedor de Mensageria */}
@@ -407,22 +633,34 @@ export const Settings: React.FC = () => {
                   type="url"
                   value={evolutionUrl}
                   onChange={(e) => setEvolutionUrl(e.target.value)}
-                  placeholder="https://api.evolution.com"
+                  placeholder="https://evogo.acessaronline.com.br"
                   className="w-full bg-white/5 border border-white/5 rounded-2xl py-3 px-4 text-xs text-white outline-none focus:ring-2 focus:ring-indigo-500/30"
                 />
               </div>
 
               <div>
-                <label className="text-[10px] text-white/30 font-bold uppercase tracking-widest mb-1 block">
-                  Nome da Instância
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="text-[10px] text-white/30 font-bold uppercase tracking-widest block">
+                    Nome da Instância (Multi-Chip)
+                  </label>
+                  {instanceId.includes(',') && (
+                    <span className="text-[9px] font-black uppercase tracking-wider text-emerald-300 bg-emerald-500/20 px-2 py-0.5 rounded-md border border-emerald-500/30">
+                      🔀 Rotação Ativa ({instanceId.split(',').filter(x => x.trim()).length} chips)
+                    </span>
+                  )}
+                </div>
                 <input
                   type="text"
                   value={instanceId}
                   onChange={(e) => setInstanceId(e.target.value)}
-                  placeholder="clinica-elo-instancia"
-                  className="w-full bg-white/5 border border-white/5 rounded-2xl py-3 px-4 text-xs text-white outline-none focus:ring-2 focus:ring-indigo-500/30"
+                  placeholder="ex: atlanticanatural ou chip-01, chip-02"
+                  className="w-full bg-white/5 border border-white/5 rounded-2xl py-3 px-4 text-xs text-white outline-none focus:ring-2 focus:ring-indigo-500/30 font-mono"
                 />
+                <p className="text-[10px] text-white/30 mt-1">
+                  {instanceId.includes(',') 
+                    ? 'O sistema revezará automaticamente os disparos entre as instâncias informadas acima.' 
+                    : 'Para rotação de múltiplos chips, separe os nomes por vírgula (ex: chip-01, chip-02).'}
+                </p>
               </div>
 
               <div>
@@ -433,7 +671,7 @@ export const Settings: React.FC = () => {
                   type="password"
                   value={apiKey}
                   onChange={(e) => setApiKey(e.target.value)}
-                  placeholder="SUA_GLOBAL_API_KEY"
+                  placeholder="d7b87fcfca7d42cfb7692298bc6d42ef"
                   className="w-full bg-white/5 border border-white/5 rounded-2xl py-3 px-4 text-xs text-white outline-none focus:ring-2 focus:ring-indigo-500/30"
                 />
               </div>

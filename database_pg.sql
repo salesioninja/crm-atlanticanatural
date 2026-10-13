@@ -62,9 +62,22 @@ CREATE TABLE IF NOT EXISTS tenant_settings (
     gemini_custom_prompt TEXT,
     dias_antecedencia_lembrete INT NOT NULL DEFAULT 1,
     horario_padrao_envio VARCHAR(10) DEFAULT '09:00',
+    antiban_delay_min INT NOT NULL DEFAULT 15,
+    antiban_delay_max INT NOT NULL DEFAULT 45,
+    antiban_batch_size INT NOT NULL DEFAULT 20,
+    antiban_batch_interval INT NOT NULL DEFAULT 5,
+    antiban_simulate_typing BOOLEAN NOT NULL DEFAULT TRUE,
+    antiban_simulate_audio BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
 );
+
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_delay_min INT DEFAULT 15;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_delay_max INT DEFAULT 45;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_batch_size INT DEFAULT 20;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_batch_interval INT DEFAULT 5;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_simulate_typing BOOLEAN DEFAULT TRUE;
+ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_simulate_audio BOOLEAN DEFAULT FALSE;
 
 -- 4. Tabela de Prospects (Leads de MMN & Clientes de Produtos)
 CREATE TABLE IF NOT EXISTS prospects (

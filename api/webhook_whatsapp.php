@@ -72,51 +72,121 @@ if (!empty($expectedWebhookSecret) && !empty($receivedSecret)) {
     }
 }
 
+function extract_jid_string($val): string {
+    if (is_string($val)) {
+        return trim($val);
+    }
+    if (is_array($val)) {
+        if (!empty($val['user'])) {
+            $u = preg_replace('/\D/', '', (string)$val['user']);
+            $s = !empty($val['server']) ? (string)$val['server'] : 's.whatsapp.net';
+            return $u ? "{$u}@{$s}" : '';
+        }
+        if (!empty($val['User'])) {
+            $u = preg_replace('/\D/', '', (string)$val['User']);
+            $s = !empty($val['Server']) ? (string)$val['Server'] : 's.whatsapp.net';
+            return $u ? "{$u}@{$s}" : '';
+        }
+        if (!empty($val['jid'])) return trim((string)$val['jid']);
+        if (!empty($val['JID'])) return trim((string)$val['JID']);
+    }
+    return '';
+}
+
+function clean_whatsapp_phone(string $jidOrPhone): string {
+    $base = explode('@', $jidOrPhone)[0] ?? $jidOrPhone;
+    $base = explode(':', $base)[0] ?? $base;
+    return preg_replace('/\D/', '', $base);
+}
+
+function extract_message_text(array $input): string {
+    $cands = [
+        $input['data']['message']['conversation'] ?? null,
+        $input['data']['message']['extendedTextMessage']['text'] ?? null,
+        $input['data']['message']['extendedTextMessage']['Text'] ?? null,
+        $input['data']['Message']['conversation'] ?? null,
+        $input['data']['Message']['Conversation'] ?? null,
+        $input['data']['Message']['extendedTextMessage']['text'] ?? null,
+        $input['data']['Message']['ExtendedTextMessage']['text'] ?? null,
+        $input['data']['Message']['ExtendedTextMessage']['Text'] ?? null,
+        $input['data']['messageText'] ?? null,
+        $input['data']['MessageText'] ?? null,
+        $input['data']['Info']['Text'] ?? null,
+        $input['data']['info']['text'] ?? null,
+        $input['data']['text'] ?? null,
+        $input['data']['Text'] ?? null,
+        $input['data']['conversation'] ?? null,
+        $input['data']['Conversation'] ?? null,
+        $input['messageText'] ?? null,
+        $input['text'] ?? null,
+        $input['message'] ?? null,
+        $input['data']['message']['buttonsResponseMessage']['selectedDisplayText'] ?? null,
+        $input['data']['message']['templateButtonReplyMessage']['selectedDisplayText'] ?? null,
+        $input['data']['message']['listResponseMessage']['title'] ?? null,
+    ];
+    foreach ($cands as $c) {
+        if (is_string($c) && trim($c) !== '') return trim($c);
+    }
+    return '';
+}
+
 $rawInput = file_get_contents('php://input');
 $input = json_decode($rawInput, true) ?: [];
 
-// Previne loop infinito: ignora mensagens enviadas pelo próprio bot (fromMe) ou grupos
-$fromMe = $input['data']['key']['fromMe'] 
-       ?? $input['data']['Info']['IsFromMe'] 
-       ?? $input['data']['isFromMe'] 
-       ?? $input['fromMe'] 
-       ?? false;
+// Identifica se é evento de mensagem enviada do próprio chip/WhatsApp (fromMe)
+$isSendMsgEvent = (isset($input['event']) && in_array(strtoupper(trim((string)$input['event'])), ['SEND_MESSAGE', 'MESSAGES_UPSERT_OUTBOUND', 'MESSAGE_SENT', 'SENT_MESSAGE'], true));
+
+$fromMeRaw = $input['data']['key']['fromMe'] 
+          ?? $input['data']['Info']['isFromMe'] 
+          ?? $input['data']['Info']['IsFromMe'] 
+          ?? $input['data']['info']['isFromMe'] 
+          ?? $input['data']['info']['IsFromMe'] 
+          ?? $input['data']['isFromMe'] 
+          ?? $input['fromMe'] 
+          ?? false;
+
+$fromMe = $isSendMsgEvent || ($fromMeRaw === true || $fromMeRaw === 'true' || $fromMeRaw === 1 || $fromMeRaw === '1');
 
 $isGroup = $input['data']['Info']['IsGroup'] 
+        ?? $input['data']['Info']['isGroup'] 
+        ?? $input['data']['info']['isGroup'] 
         ?? $input['data']['isGroup'] 
         ?? false;
 
-if ($isGroup === true) {
+if ($isGroup === true || $isGroup === 'true' || $isGroup === 1 || $isGroup === '1') {
     http_response_code(200);
     header("Content-Type: application/json; charset=UTF-8");
     echo json_encode(["status" => "ignored", "reason" => "Mensagem enviada em grupo ignorada."]);
     exit;
 }
 
-// Extração resiliente dos metadados da mensagem recebida (Evolution API / Evolution Go / n8n / Meta)
-$remoteJid = $input['data']['Info']['Chat'] 
-          ?? $input['data']['Info']['Sender'] 
-          ?? $input['data']['key']['remoteJid'] 
-          ?? $input['phone'] 
-          ?? $input['number'] 
-          ?? $input['from'] 
+// Extração resiliente dos metadados da mensagem (compatível com WhatsMeow / Evolution GO / Baileys)
+$rawChat = $input['data']['key']['remoteJid'] 
+        ?? $input['data']['Info']['chat'] 
+        ?? $input['data']['Info']['Chat'] 
+        ?? $input['data']['info']['chat'] 
+        ?? $input['data']['info']['Chat'] 
+        ?? $input['data']['chat'] 
+        ?? $input['data']['Chat'] 
+        ?? '';
+
+$rawSender = $input['data']['Info']['sender']
+          ?? $input['data']['Info']['Sender']
+          ?? $input['data']['info']['sender']
+          ?? $input['data']['info']['Sender']
+          ?? $input['data']['sender']
+          ?? $input['data']['Sender']
           ?? '';
 
-$textReceived = $input['data']['message']['conversation'] 
-              ?? $input['data']['message']['extendedTextMessage']['text'] 
-              ?? $input['data']['Message']['conversation'] 
-              ?? $input['data']['Message']['extendedTextMessage']['text'] 
-              ?? $input['data']['Message']['ExtendedTextMessage']['Text'] 
-              ?? $input['data']['Message']['Conversation'] 
-              ?? $input['data']['conversation']
-              ?? $input['data']['text']
-              ?? $input['data']['message']['buttonsResponseMessage']['selectedDisplayText']
-              ?? $input['data']['message']['templateButtonReplyMessage']['selectedDisplayText']
-              ?? $input['data']['message']['listResponseMessage']['title']
-              ?? $input['messageText'] 
-              ?? $input['text'] 
-              ?? $input['message'] 
-              ?? '';
+$remoteJid = extract_jid_string($rawChat);
+if (empty($remoteJid) && !$fromMe) {
+    $remoteJid = extract_jid_string($rawSender);
+}
+if (empty($remoteJid)) {
+    $remoteJid = extract_jid_string($input['phone'] ?? $input['number'] ?? $input['from'] ?? '');
+}
+
+$textReceived = extract_message_text($input);
 
 $instanceId = $_GET['instance']
            ?? $input['instanceId'] 
@@ -148,11 +218,13 @@ if (!empty($instanceId)) {
 }
 
 $pushName = $input['data']['Info']['PushName'] 
+         ?? $input['data']['Info']['pushName'] 
+         ?? $input['data']['info']['pushName'] 
          ?? $input['data']['pushName'] 
          ?? $input['pushName'] 
          ?? '';
 
-// Retorna 200 imediatamente se a mensagem estiver vazia ou for evento de sistema
+// Retorna 200 imediatamente se a mensagem estiver vazia ou for evento de sistema sem texto
 if (empty($remoteJid) || empty(trim($textReceived))) {
     http_response_code(200);
     header("Content-Type: application/json; charset=UTF-8");
@@ -162,15 +234,15 @@ if (empty($remoteJid) || empty(trim($textReceived))) {
 
 // Sincronização de mensagens enviadas pelo próprio número (fromMe = true)
 // Ex: Líder ou atendente respondendo diretamente pelo WhatsApp no celular
-if ($fromMe === true) {
+if ($fromMe) {
     try {
-        $phoneDigitsFromMe = preg_replace('/[^0-9]/', '', str_replace('@s.whatsapp.net', '', $remoteJid));
+        $phoneDigitsFromMe = clean_whatsapp_phone($remoteJid);
         $suffix8FromMe = strlen($phoneDigitsFromMe) >= 8 ? substr($phoneDigitsFromMe, -8) : $phoneDigitsFromMe;
         
         $tenantIdFromMe = get_env_var('TENANT_ID', 'atlanticanatural');
         if (!empty($instanceId)) {
-            $stmtTenant = $db->prepare("SELECT tenant_id FROM tenant_settings WHERE evolution_instance = ? OR evolution_instance_name = ? LIMIT 1");
-            $stmtTenant->execute([$instanceId, $instanceId]);
+            $stmtTenant = $db->prepare("SELECT tenant_id FROM tenant_settings WHERE evolution_instance = ? OR evolution_instance_name = ? OR evolution_instance LIKE ? OR evolution_instance_name LIKE ? LIMIT 1");
+            $stmtTenant->execute([$instanceId, $instanceId, "%{$instanceId}%", "%{$instanceId}%"]);
             $cfg = $stmtTenant->fetch();
             if ($cfg && !empty($cfg['tenant_id'])) {
                 $tenantIdFromMe = $cfg['tenant_id'];
@@ -180,8 +252,12 @@ if ($fromMe === true) {
         $tFamFromMe = ($tenantIdFromMe === 'crmclinica') ? ['crmclinica'] : get_tenant_family($tenantIdFromMe);
         $tInFromMe = implode(',', array_fill(0, count($tFamFromMe), '?'));
 
+        $patientIdFromMe = null;
+        $patientNameFromMe = 'Contato WhatsApp';
+
+        // 1. Busca em patients
         $stmtPat = $db->prepare("
-            SELECT id FROM patients 
+            SELECT id, name FROM patients 
             WHERE tenant_id IN ({$tInFromMe})
               AND (
                   REPLACE(REPLACE(REPLACE(REPLACE(phone, ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
@@ -195,10 +271,63 @@ if ($fromMe === true) {
 
         if ($patFromMe && !empty($patFromMe['id'])) {
             $patientIdFromMe = $patFromMe['id'];
-            $cleanContent = trim($textReceived);
+            if (!empty($patFromMe['name'])) $patientNameFromMe = $patFromMe['name'];
+        } else {
+            // 2. Busca em prospects
+            try {
+                $stmtPrsp = $db->prepare("
+                    SELECT id, nome FROM prospects 
+                    WHERE tenant_id IN ({$tInFromMe})
+                      AND (
+                          REPLACE(REPLACE(REPLACE(REPLACE(whatsapp, ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
+                          OR REPLACE(REPLACE(REPLACE(REPLACE(whatsapp, ' ', ''), '-', ''), '(', ''), ')', '') LIKE ?
+                      )
+                    ORDER BY id DESC LIMIT 1
+                ");
+                $stmtPrsp->execute(array_merge($tFamFromMe, ['%' . $phoneDigitsFromMe, '%' . $suffix8FromMe]));
+                $prspFromMe = $stmtPrsp->fetch(PDO::FETCH_ASSOC);
+                if ($prspFromMe && !empty($prspFromMe['id'])) {
+                    $patientIdFromMe = $prspFromMe['id'];
+                    if (!empty($prspFromMe['nome'])) $patientNameFromMe = $prspFromMe['nome'];
+                }
+            } catch (Throwable $ePr) {}
+        }
 
-            // Verifica se a mensagem já foi gravada nos últimos 120s (evita duplicar envios feitos pelo CRM, Cron ou IA)
-            $time120sAgo = date('Y-m-d H:i:s', time() - 120);
+        // 3. Se ainda não existir em nenhuma tabela, auto-cadastra!
+        if (!$patientIdFromMe && !empty($phoneDigitsFromMe)) {
+            $patientIdFromMe = 'prsp_' . uniqid();
+            try {
+                $stmtNewPrsp = $db->prepare("
+                    INSERT INTO prospects (id, tenant_id, nome, whatsapp, email, fase_funil, perfil_interesse, bot_status)
+                    VALUES (?, ?, ?, ?, 'N/A', 'Novo Lead', 'Revendedor', 'active')
+                ");
+                $stmtNewPrsp->execute([$patientIdFromMe, $tenantIdFromMe, $patientNameFromMe, $phoneDigitsFromMe]);
+            } catch (Throwable $eInsPr) {
+                try {
+                    $stmtNewPat = $db->prepare("
+                        INSERT INTO patients (id, tenant_id, name, phone, email, bot_status)
+                        VALUES (?, ?, ?, ?, 'N/A', 'active')
+                    ");
+                    $stmtNewPat->execute([$patientIdFromMe, $tenantIdFromMe, $patientNameFromMe, $phoneDigitsFromMe]);
+                } catch (Throwable $eInsPt) {}
+            }
+        }
+
+        $cleanContent = trim($textReceived);
+
+        if ($patientIdFromMe && !empty($cleanContent)) {
+            // Determina o nome do remetente com base na instância disparadora
+            $senderLabel = 'Atendente (WhatsApp)';
+            if (!empty($instanceId)) {
+                if (stripos($instanceId, 'maximo') !== false) {
+                    $senderLabel = 'Máximo (WhatsApp)';
+                } elseif (stripos($instanceId, 'atlantica') !== false) {
+                    $senderLabel = 'Atlântica (WhatsApp)';
+                }
+            }
+
+            // Verifica se a mensagem já foi gravada nos últimos 15s (evita duplicar envios feitos pelo CRM ou IA)
+            $time15sAgo = date('Y-m-d H:i:s', time() - 15);
             $stmtCheck = $db->prepare("
                 SELECT COUNT(*) FROM messages 
                 WHERE (patient_id = ? OR prospect_id = ?) 
@@ -206,23 +335,23 @@ if ($fromMe === true) {
                   AND TRIM(content) = ? 
                   AND created_at >= ?
             ");
-            $stmtCheck->execute([$patientIdFromMe, $patientIdFromMe, $cleanContent, $time120sAgo]);
+            $stmtCheck->execute([$patientIdFromMe, $patientIdFromMe, $cleanContent, $time15sAgo]);
             $alreadyExists = ((int)$stmtCheck->fetchColumn() > 0);
 
             if (!$alreadyExists) {
                 $msgId = 'msg_' . uniqid();
                 $stmtInsertOut = $db->prepare("
                     INSERT INTO messages (id, tenant_id, patient_id, prospect_id, direction, content, sender_name, created_at)
-                    VALUES (?, ?, ?, ?, 'outbound', ?, 'Atendente (WhatsApp)', NOW())
+                    VALUES (?, ?, ?, ?, 'outbound', ?, ?, NOW())
                 ");
-                $stmtInsertOut->execute([$msgId, $tenantIdFromMe, $patientIdFromMe, $patientIdFromMe, $cleanContent]);
+                $stmtInsertOut->execute([$msgId, $tenantIdFromMe, $patientIdFromMe, $patientIdFromMe, $cleanContent, $senderLabel]);
 
                 record_interaction_safely(
                     $db, 
                     $tenantIdFromMe, 
                     $patientIdFromMe, 
                     'whatsapp_sent', 
-                    "Mensagem enviada via celular pelo atendente: " . mb_substr($cleanContent, 0, 100)
+                    "Mensagem enviada via celular por {$senderLabel}: " . mb_substr($cleanContent, 0, 100)
                 );
             }
         }
@@ -266,8 +395,8 @@ if ($fpLock) {
     @fwrite($fpLock, (string)time());
 }
 
-// Higieniza número de telefone (remove sufixo WhatsApp e caracteres não numéricos)
-$phoneDigits = preg_replace('/[^0-9]/', '', str_replace('@s.whatsapp.net', '', $remoteJid));
+// Higieniza número de telefone (remove sufixo WhatsApp e dispositivo multi-device)
+$phoneDigits = clean_whatsapp_phone($remoteJid);
 $timestampActual = date('d/m/Y H:i:s');
 
 // Gera variações com e sem o nono dígito para busca resiliente
@@ -310,13 +439,13 @@ try {
     $config = null;
     if (!empty($instanceId)) {
         if (!empty($tenantId)) {
-            $stmtTenant = $db->prepare("SELECT * FROM tenant_settings WHERE tenant_id = ? AND (evolution_instance = ? OR evolution_instance_name = ?) LIMIT 1");
-            $stmtTenant->execute([$tenantId, $instanceId, $instanceId]);
+            $stmtTenant = $db->prepare("SELECT * FROM tenant_settings WHERE tenant_id = ? AND (evolution_instance = ? OR evolution_instance_name = ? OR evolution_instance LIKE ? OR evolution_instance_name LIKE ?) LIMIT 1");
+            $stmtTenant->execute([$tenantId, $instanceId, $instanceId, "%{$instanceId}%", "%{$instanceId}%"]);
             $config = $stmtTenant->fetch(PDO::FETCH_ASSOC);
         }
         if (!$config) {
-            $stmtTenant = $db->prepare("SELECT * FROM tenant_settings WHERE evolution_instance = ? OR evolution_instance_name = ? ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END LIMIT 1");
-            $stmtTenant->execute([$instanceId, $instanceId, $tenantId]);
+            $stmtTenant = $db->prepare("SELECT * FROM tenant_settings WHERE evolution_instance = ? OR evolution_instance_name = ? OR evolution_instance LIKE ? OR evolution_instance_name LIKE ? ORDER BY CASE WHEN tenant_id = ? THEN 0 ELSE 1 END LIMIT 1");
+            $stmtTenant->execute([$instanceId, $instanceId, "%{$instanceId}%", "%{$instanceId}%", $tenantId]);
             $config = $stmtTenant->fetch(PDO::FETCH_ASSOC);
             if ($config && !empty($config['tenant_id'])) {
                 $tenantId = $config['tenant_id'];
@@ -1044,8 +1173,8 @@ MMNPROMPT;
             $finalText = trim(preg_replace('/\[CMD_AGENDAR:[^\]]+\]/i', '', $finalText));
         }
 
-        // Envia a resposta da IA para o WhatsApp do prospect via Evolution Go
-        $sendResult = send_evolution_whatsapp_message($db, $tenantId, $phoneDigits, $finalText);
+        // Envia a resposta da IA para o WhatsApp do prospect via Evolution Go na mesma instância
+        $sendResult = send_evolution_whatsapp_message($db, $tenantId, $phoneDigits, $finalText, !empty($instanceId) ? $instanceId : null);
 
         // Registra mensagem enviada no chat omnichannel e na linha do tempo
         $outMsgId = 'msg_' . uniqid();

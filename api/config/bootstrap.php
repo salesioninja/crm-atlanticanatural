@@ -312,14 +312,13 @@ function apply_curl_ssl_opts($ch): void {
 function call_gemini_generate_content(string $prompt, string $apiKey, ?string $preferredModel = null): ?string {
     if (empty($apiKey) || empty($prompt)) return null;
     $primaryModel = $preferredModel ?: (defined('GEMINI_MODEL') ? GEMINI_MODEL : 'gemini-flash-lite-latest');
-    $modelsToTry = array_unique([
-        $primaryModel,
+    // Prioriza modelos estáveis, de alta velocidade e com suporte ativo na API v1beta
+    $modelsToTry = array_values(array_unique(array_filter([
         'gemini-flash-lite-latest',
-        'gemini-2.5-flash',
-        'gemini-1.5-flash',
-        'gemini-2.0-flash',
-        'gemini-flash-latest'
-    ]);
+        'gemini-3.5-flash-lite',
+        $primaryModel,
+        'gemini-3.5-flash'
+    ])));
     $payload = ["contents" => [["parts" => [["text" => $prompt]]]]];
     $jsonPayload = json_encode($payload);
 
@@ -330,18 +329,28 @@ function call_gemini_generate_content(string $prompt, string $apiKey, ?string $p
         curl_setopt($ch, CURLOPT_POST, true);
         curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
         curl_setopt($ch, CURLOPT_POSTFIELDS, $jsonPayload);
-        curl_setopt($ch, CURLOPT_TIMEOUT, 8);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 12);
         apply_curl_ssl_opts($ch);
         $raw = curl_exec($ch);
         $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $curlErr = curl_error($ch);
         curl_close($ch);
 
         if ($httpCode === 200 && $raw) {
             $data = json_decode($raw, true);
-            $text = trim($data['candidates'][0]['content']['parts'][0]['text'] ?? '');
-            if (!empty($text)) {
-                return $text;
+            $parts = $data['candidates'][0]['content']['parts'] ?? [];
+            $textParts = [];
+            foreach ($parts as $p) {
+                if (!empty($p['text'])) {
+                    $textParts[] = $p['text'];
+                }
             }
+            $fullText = trim(implode("\n", $textParts));
+            if (!empty($fullText)) {
+                return $fullText;
+            }
+        } else {
+            error_log("Gemini API falhou para modelo {$model}: HTTP {$httpCode}, err: {$curlErr}");
         }
     }
     return null;
@@ -821,7 +830,7 @@ function calculate_clinic_free_slots(PDO $db, string $tenantId, ?string $dateInp
 /**
  * Envia mensagem pelo WhatsApp via Evolution API de forma padronizada e segura.
  */
-function send_evolution_whatsapp_message(PDO $db, string $tenantId, string $phone, string $text): array {
+function send_evolution_whatsapp_message(PDO $db, string $tenantId, string $phone, string $text, ?string $instanceOverride = null): array {
     $telefoneLimpo = preg_replace('/\D/', '', $phone);
     if (empty($telefoneLimpo) || empty($text)) {
         return ["success" => false, "error" => "Telefone ou texto inválido."];
@@ -838,7 +847,25 @@ function send_evolution_whatsapp_message(PDO $db, string $tenantId, string $phon
 
         $evoUrl = !empty($tenantConf['evolution_api_url']) ? $tenantConf['evolution_api_url'] : ($tenantConf['evolution_url'] ?? get_env_var('EVOLUTION_API_URL', 'https://evogo.acessaronline.com.br'));
         $evoApiKey = !empty($tenantConf['evolution_api_key']) ? $tenantConf['evolution_api_key'] : ($tenantConf['evolution_apikey'] ?? get_env_var('EVOLUTION_API_KEY', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
-        $evoInstance = !empty($tenantConf['evolution_instance_name']) ? $tenantConf['evolution_instance_name'] : ($tenantConf['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural'));
+        
+        $rawInstance = !empty($instanceOverride) 
+            ? $instanceOverride 
+            : (!empty($tenantConf['evolution_instance_name']) 
+                ? $tenantConf['evolution_instance_name'] 
+                : ($tenantConf['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural, Teste-disparo-maximo')));
+
+        // Parser para Rotação Multi-Chip: suporta nomes separados por vírgula
+        $instancesList = array_values(array_filter(array_map('trim', preg_split('/[,;]+/', (string)$rawInstance))));
+        if (empty($instancesList) || (count($instancesList) === 1 && $instancesList[0] === 'atlanticanatural')) {
+            $instancesList = ['atlanticanatural', 'Teste-disparo-maximo'];
+        }
+        $evoInstance = !empty($instancesList) ? $instancesList[0] : 'atlanticanatural';
+        if (empty($instanceOverride) && count($instancesList) > 1) {
+            $counterFile = sys_get_temp_dir() . "/evo_rotation_" . md5($tenantId) . ".txt";
+            $lastIdx = file_exists($counterFile) ? (int)@file_get_contents($counterFile) : 0;
+            $evoInstance = $instancesList[$lastIdx % count($instancesList)];
+            @file_put_contents($counterFile, (string)(($lastIdx + 1) % count($instancesList)));
+        }
 
         if (empty($evoApiKey)) {
             $evoApiKey = get_env_var('GLOBAL_API_KEY', get_env_var('CRON_API_SECRET', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
@@ -863,12 +890,26 @@ function send_evolution_whatsapp_message(PDO $db, string $tenantId, string $phon
                 curl_close($chAll);
                 if ($resAll) {
                     $allDec = json_decode($resAll, true) ?: [];
+                    $targetItem = null;
                     foreach ($allDec['data'] ?? [] as $item) {
-                        if (($item['name'] ?? '') === $evoInstance) {
+                        if (strcasecmp($item['name'] ?? '', $evoInstance) === 0) {
+                            $targetItem = $item;
                             if (!empty($item['token'])) {
                                 $evoApiKey = $item['token'];
                             }
                             break;
+                        }
+                    }
+                    // Failover Automático: Se a instância alvo não estiver conectada, usa outra conectada da lista
+                    if ((empty($targetItem) || empty($targetItem['connected'])) && count($instancesList) > 1) {
+                        foreach ($allDec['data'] ?? [] as $item) {
+                            if (in_array($item['name'] ?? '', $instancesList) && !empty($item['connected'])) {
+                                $evoInstance = $item['name'];
+                                if (!empty($item['token'])) {
+                                    $evoApiKey = $item['token'];
+                                }
+                                break;
+                            }
                         }
                     }
                 }
@@ -938,6 +979,142 @@ function send_evolution_whatsapp_message(PDO $db, string $tenantId, string $phon
     }
 }
 
+/**
+ * Simula presença humana no WhatsApp via Evolution API (ex: 'composing' para 'Digitando...' ou 'recording' para 'Gravando áudio...')
+ */
+function send_evolution_presence($db, $tenantId, $telefone, $presence = 'composing', $delayMs = 2500, ?string $instanceOverride = null) {
+    try {
+        if (!$db) return ["success" => false, "error" => "Sem conexão com banco de dados."];
+
+        $telefoneLimpo = preg_replace('/\D/', '', $telefone);
+        if (empty($telefoneLimpo)) {
+            return ["success" => false, "error" => "Número de telefone inválido."];
+        }
+
+        $stmt = $db->prepare("SELECT evolution_url, evolution_api_url, evolution_apikey, evolution_api_key, evolution_instance, evolution_instance_name FROM tenant_settings WHERE tenant_id = ? LIMIT 1");
+        $stmt->execute([$tenantId]);
+        $tenantConf = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+
+        $evoUrl = !empty($tenantConf['evolution_api_url']) ? $tenantConf['evolution_api_url'] : ($tenantConf['evolution_url'] ?? get_env_var('EVOLUTION_API_URL', 'https://evogo.acessaronline.com.br'));
+        $evoApiKey = !empty($tenantConf['evolution_api_key']) ? $tenantConf['evolution_api_key'] : ($tenantConf['evolution_apikey'] ?? get_env_var('EVOLUTION_API_KEY', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
+        
+        $rawInstance = !empty($instanceOverride) 
+            ? $instanceOverride 
+            : (!empty($tenantConf['evolution_instance_name']) 
+                ? $tenantConf['evolution_instance_name'] 
+                : ($tenantConf['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural, Teste-disparo-maximo')));
+
+        $instancesList = array_values(array_filter(array_map('trim', preg_split('/[,;]+/', (string)$rawInstance))));
+        if (empty($instancesList) || (count($instancesList) === 1 && $instancesList[0] === 'atlanticanatural')) {
+            $instancesList = ['atlanticanatural', 'Teste-disparo-maximo'];
+        }
+        $evoInstance = !empty($instancesList) ? $instancesList[0] : 'atlanticanatural';
+        if (empty($instanceOverride) && count($instancesList) > 1) {
+            $counterFile = sys_get_temp_dir() . "/evo_rotation_" . md5($tenantId) . ".txt";
+            $lastIdx = file_exists($counterFile) ? (int)@file_get_contents($counterFile) : 0;
+            $evoInstance = $instancesList[$lastIdx % count($instancesList)];
+        }
+
+        if (empty($evoApiKey)) {
+            $evoApiKey = get_env_var('GLOBAL_API_KEY', get_env_var('CRON_API_SECRET', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
+        }
+
+        if (empty($evoUrl) || empty($evoInstance)) {
+            return ["success" => false, "error" => "Evolution API não configurada."];
+        }
+
+        $isEvoGo = (strpos($evoUrl, 'evogo') !== false || strpos($evoUrl, ':8080') !== false);
+        $globalApiKey = get_env_var('GLOBAL_API_KEY', get_env_var('CRON_API_SECRET', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
+
+        if ($isEvoGo) {
+            try {
+                $chAll = curl_init(rtrim($evoUrl, '/') . "/instance/all");
+                curl_setopt($chAll, CURLOPT_RETURNTRANSFER, true);
+                curl_setopt($chAll, CURLOPT_HTTPHEADER, ["apikey: " . $globalApiKey, "Content-Type: application/json"]);
+                apply_curl_ssl_opts($chAll);
+                curl_setopt($chAll, CURLOPT_TIMEOUT, 4);
+                $resAll = curl_exec($chAll);
+                curl_close($chAll);
+                if ($resAll) {
+                    $allDec = json_decode($resAll, true) ?: [];
+                    $targetItem = null;
+                    foreach ($allDec['data'] ?? [] as $item) {
+                        if (strcasecmp($item['name'] ?? '', $evoInstance) === 0) {
+                            $targetItem = $item;
+                            if (!empty($item['token'])) {
+                                $evoApiKey = $item['token'];
+                            }
+                            break;
+                        }
+                    }
+                    if ((empty($targetItem) || empty($targetItem['connected'])) && count($instancesList) > 1) {
+                        foreach ($allDec['data'] ?? [] as $item) {
+                            if (in_array($item['name'] ?? '', $instancesList) && !empty($item['connected'])) {
+                                $evoInstance = $item['name'];
+                                if (!empty($item['token'])) {
+                                    $evoApiKey = $item['token'];
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            } catch (Throwable $eToken) {}
+        }
+
+        $headers = [
+            "apikey: " . $evoApiKey,
+            "Content-Type: application/json"
+        ];
+
+        $primaryUrl = $isEvoGo
+            ? (rtrim($evoUrl, '/') . '/chat/sendPresence')
+            : (rtrim($evoUrl, '/') . '/chat/sendPresence/' . urlencode($evoInstance));
+        $fallbackUrl = $isEvoGo
+            ? (rtrim($evoUrl, '/') . '/chat/sendPresence/' . urlencode($evoInstance))
+            : (rtrim($evoUrl, '/') . '/chat/sendPresence');
+
+        $payload = [
+            "number" => $telefoneLimpo,
+            "presence" => $presence,
+            "delay" => (int)$delayMs
+        ];
+
+        $ch = curl_init($primaryUrl);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $headers);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload));
+        apply_curl_ssl_opts($ch);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 6);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        if ($httpCode === 404) {
+            $chFallback = curl_init($fallbackUrl);
+            curl_setopt($chFallback, CURLOPT_RETURNTRANSFER, true);
+            curl_setopt($chFallback, CURLOPT_POST, true);
+            curl_setopt($chFallback, CURLOPT_HTTPHEADER, $headers);
+            curl_setopt($chFallback, CURLOPT_POSTFIELDS, json_encode($payload));
+            apply_curl_ssl_opts($chFallback);
+            curl_setopt($chFallback, CURLOPT_TIMEOUT, 6);
+            $response = curl_exec($chFallback);
+            $httpCode = curl_getinfo($chFallback, CURLINFO_HTTP_CODE);
+            curl_close($chFallback);
+        }
+
+        return [
+            "success" => ($httpCode >= 200 && $httpCode < 300),
+            "http_code" => $httpCode,
+            "response" => $response
+        ];
+    } catch (Throwable $e) {
+        return ["success" => false, "error" => $e->getMessage()];
+    }
+}
+
 if (!function_exists('sync_google_calendar_event')) {
     /**
      * Sincroniza um agendamento do banco com a Google Agenda do profissional associado.
@@ -945,7 +1122,7 @@ if (!function_exists('sync_google_calendar_event')) {
     function sync_google_calendar_event($db, $appointmentId, $tenantId, $action) {
         try {
             $stmt = $db->prepare("
-                SELECT a.id, a.appointment_time, a.treatment_command, a.category, a.event_id,
+                SELECT a.id, a.logs, a.appointment_time, a.treatment_command, a.category, a.event_id,
                        COALESCE(p.name, pr.nome) AS patient_name,
                        COALESCE(p.phone, pr.whatsapp) AS patient_phone,
                        u.id AS user_id, u.name AS user_name, u.email AS user_email, u.google_access_token, u.google_refresh_token, u.google_token_expires
@@ -961,6 +1138,18 @@ if (!function_exists('sync_google_calendar_event')) {
             if (!$appt) {
                 return false;
             }
+
+            $saveApptLog = function($logMsg, $newEventId = null) use ($db, $appointmentId, &$appt) {
+                try {
+                    $appt['logs'] = ($appt['logs'] ?? '') . $logMsg;
+                    if (!empty($newEventId)) {
+                        $appt['event_id'] = $newEventId;
+                        $db->prepare("UPDATE appointments SET event_id = ?, logs = ? WHERE id = ?")->execute([$newEventId, $appt['logs'], $appointmentId]);
+                    } else {
+                        $db->prepare("UPDATE appointments SET logs = ? WHERE id = ?")->execute([$appt['logs'], $appointmentId]);
+                    }
+                } catch (Throwable $th) {}
+            };
 
             // Se o profissional específico não tiver token, busca qualquer líder/usuário do tenant com Google conectado
             if (empty($appt['google_refresh_token'])) {
@@ -985,7 +1174,7 @@ if (!function_exists('sync_google_calendar_event')) {
                     $appt['google_token_expires'] = $userFallback['google_token_expires'];
                 } else {
                     $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha Google Calendar: Nenhum usuário com Google conectado para o tenant '{$tenantId}'.";
-                    $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
+                    $saveApptLog($errLog);
                     error_log("[Google Calendar Sync] Sem conta Google conectada para o tenant {$tenantId} (Agendamento: {$appointmentId})");
                     return false;
                 }
@@ -1033,7 +1222,7 @@ if (!function_exists('sync_google_calendar_event')) {
                         $stmtUpdateUser->execute([$accessToken, $newExpiresAt, $appt['user_id']]);
                     } else {
                         $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha renovar token Google (HTTP {$httpCode}): {$response}";
-                        $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
+                        $saveApptLog($errLog);
                         error_log("[Google Calendar Sync] Falha ao renovar token OAuth: HTTP {$httpCode} - {$response}");
                     }
                 }
@@ -1041,7 +1230,7 @@ if (!function_exists('sync_google_calendar_event')) {
             
             if (empty($accessToken)) {
                 $errLog = "\n[" . date('d/m/Y H:i:s') . "] Falha Google Calendar: Token de acesso vazio ou não pôde ser renovado.";
-                $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?")->execute([$errLog, $appointmentId]);
+                $saveApptLog($errLog);
                 error_log("[Google Calendar Sync] Access token vazio para agendamento {$appointmentId}");
                 return false;
             }
@@ -1148,15 +1337,13 @@ if (!function_exists('sync_google_calendar_event')) {
                     if (!empty($event['id'])) {
                         $timeLog = date('d/m/Y H:i:s');
                         $logMsg = "\n[{$timeLog}] Evento Google Agenda criado com sucesso (ID: {$event['id']}).";
-                        $stmtSaveEvent = $db->prepare("UPDATE appointments SET event_id = ?, logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                        $stmtSaveEvent->execute([$event['id'], $logMsg, $appointmentId]);
+                        $saveApptLog($logMsg, $event['id']);
                         return true;
                     }
                 } else {
                     $timeLog = date('d/m/Y H:i:s');
                     $logMsg = "\n[{$timeLog}] Falha ao criar no Google Calendar (HTTP {$httpCode}): " . $res;
-                    $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                    $stmtLog->execute([$logMsg, $appointmentId]);
+                    $saveApptLog($logMsg);
                     error_log("[Google Calendar Sync] Falha ao criar evento ({$appointmentId}): HTTP {$httpCode} - {$res}");
                     return false;
                 }
@@ -1179,8 +1366,7 @@ if (!function_exists('sync_google_calendar_event')) {
                 if ($httpCode === 200 || $httpCode === 201) {
                     $timeLog = date('d/m/Y H:i:s');
                     $logMsg = "\n[{$timeLog}] Evento Google Agenda atualizado com sucesso.";
-                    $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                    $stmtLog->execute([$logMsg, $appointmentId]);
+                    $saveApptLog($logMsg);
                     return true;
                 } elseif ($httpCode === 404 || $httpCode === 410) {
                     // Se foi apagada no Google Calendar, recria
@@ -1204,16 +1390,14 @@ if (!function_exists('sync_google_calendar_event')) {
                         if (!empty($event2['id'])) {
                             $timeLog = date('d/m/Y H:i:s');
                             $logMsg = "\n[{$timeLog}] Evento Google Agenda recriado com sucesso (ID: {$event2['id']}).";
-                            $stmtSaveEvent = $db->prepare("UPDATE appointments SET event_id = ?, logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                            $stmtSaveEvent->execute([$event2['id'], $logMsg, $appointmentId]);
+                            $saveApptLog($logMsg, $event2['id']);
                             return true;
                         }
                     }
                 } else {
                     $timeLog = date('d/m/Y H:i:s');
                     $logMsg = "\n[{$timeLog}] Falha ao atualizar evento no Google Calendar (HTTP {$httpCode}): " . $res;
-                    $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                    $stmtLog->execute([$logMsg, $appointmentId]);
+                    $saveApptLog($logMsg);
                     error_log("[Google Calendar Sync] Falha ao atualizar evento ({$appointmentId}): HTTP {$httpCode} - {$res}");
                     return false;
                 }
@@ -1221,11 +1405,10 @@ if (!function_exists('sync_google_calendar_event')) {
             return true;
         } catch (Throwable $e) {
             error_log("[Google Calendar Sync Exception] " . $e->getMessage() . " at " . $e->getFile() . ":" . $e->getLine());
-            try {
+            if (isset($saveApptLog)) {
                 $timeLog = date('d/m/Y H:i:s');
-                $stmtLog = $db->prepare("UPDATE appointments SET logs = CONCAT(COALESCE(logs, ''), ?) WHERE id = ?");
-                $stmtLog->execute(["\n[{$timeLog}] Erro interno sincronização Google Calendar: " . $e->getMessage(), $appointmentId]);
-            } catch (Throwable $thLog) {}
+                $saveApptLog("\n[{$timeLog}] Erro interno sincronização Google Calendar: " . $e->getMessage());
+            }
             return false;
         }
     }

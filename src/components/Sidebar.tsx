@@ -66,7 +66,7 @@ export default function Sidebar({
     { id: 'simulacoes', name: 'Simulações de Lucro', icon: Play, view: 'simulacoes' as const },
     { id: 'integracao', name: 'Integrações', icon: Zap, view: 'integracao' as const },
     { id: 'dispositivos', name: 'WhatsApp Conectado', icon: Smartphone, view: 'dispositivos' as const },
-    { id: 'configuracoes', name: 'Configurações da IA', icon: Settings, view: 'configuracoes' as const },
+    { id: 'configuracoes', name: 'Configurações & Anti-Ban', icon: Settings, view: 'configuracoes' as const },
   ];
 
   const { isSuperAdmin, tenantId, tenantName } = useAuth();

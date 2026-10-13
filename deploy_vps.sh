@@ -18,6 +18,9 @@ docker cp /root/crm_atlantica_deploy/. crm_atlantica_app:/var/www/html/
 echo "Ajustando permissoes www-data..."
 docker exec crm_atlantica_app chown -R www-data:www-data /var/www/html/
 
+echo "Aplicando migracoes e atualizacoes de banco de dados..."
+docker exec crm_atlantica_app php /var/www/html/api/config/init_db.php || true
+
 echo "Reiniciando crm_atlantica_app..."
 docker restart crm_atlantica_app
 

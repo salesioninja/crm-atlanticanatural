@@ -142,11 +142,15 @@ try {
                 );
 
                 INSERT INTO tenant_settings (tenant_id, evolution_api_url, evolution_api_key, evolution_instance_name)
-                VALUES ('atlanticanatural', 'https://evogo.acessaronline.com.br', 'd7b87fcfca7d42cfb7692298bc6d42ef', 'atlanticanatural')
+                VALUES ('atlanticanatural', 'https://evogo.acessaronline.com.br', 'd7b87fcfca7d42cfb7692298bc6d42ef', 'atlanticanatural, Teste-disparo-maximo')
                 ON CONFLICT (tenant_id) DO UPDATE SET 
                     evolution_api_url = EXCLUDED.evolution_api_url,
                     evolution_api_key = EXCLUDED.evolution_api_key,
-                    evolution_instance_name = EXCLUDED.evolution_instance_name;
+                    evolution_instance_name = CASE 
+                        WHEN tenant_settings.evolution_instance_name LIKE '%Teste-disparo-maximo%' 
+                        THEN tenant_settings.evolution_instance_name 
+                        ELSE 'atlanticanatural, Teste-disparo-maximo' 
+                    END;
             ");
         }
 
@@ -157,6 +161,13 @@ try {
                 event_id VARCHAR(255) PRIMARY KEY,
                 deleted_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
             );
+
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_delay_min INT DEFAULT 15;
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_delay_max INT DEFAULT 45;
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_batch_size INT DEFAULT 20;
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_batch_interval INT DEFAULT 5;
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_simulate_typing BOOLEAN DEFAULT TRUE;
+            ALTER TABLE tenant_settings ADD COLUMN IF NOT EXISTS antiban_simulate_audio BOOLEAN DEFAULT FALSE;
 
             INSERT INTO users (id, tenant_id, email, name, nome, role, perfil, status, ativo)
             VALUES 

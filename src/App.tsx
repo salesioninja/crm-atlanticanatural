@@ -414,7 +414,7 @@ function AppContent() {
 
         <TopBar 
           onSearch={setSearchTerm} 
-          onOpenSettings={() => setIsSettingsModalOpen(true)}
+          onOpenSettings={() => setCurrentView('configuracoes')}
           onToggleMobileMenu={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
         />
         
@@ -693,9 +693,21 @@ function AppContent() {
             <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">Informações de Integração</p>
             <p className="text-xs text-white/40">O gateway da API do WhatsApp está conectado de forma nativa e o Hot Module Replacement (HMR) está ativado.</p>
           </div>
+          <div className="pt-2">
+            <button 
+              type="button"
+              onClick={() => {
+                setIsSettingsModalOpen(false);
+                setCurrentView('configuracoes');
+              }}
+              className="w-full bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/30 py-3.5 rounded-2xl font-bold text-xs uppercase tracking-wider flex items-center justify-center gap-2 transition-all shadow-lg"
+            >
+              🛡️ Abrir Parâmetros Anti-Ban & Configurações da IA
+            </button>
+          </div>
           <button 
             type="submit"
-            className="w-full bg-white text-indigo-600 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest mt-4 shadow-xl hover:bg-white/90 transition-all"
+            className="w-full bg-white text-indigo-600 py-4 rounded-2xl font-bold text-xs uppercase tracking-widest mt-2 shadow-xl hover:bg-white/90 transition-all"
           >
             Salvar Configurações
           </button>

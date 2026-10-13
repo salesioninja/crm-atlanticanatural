@@ -263,12 +263,39 @@ try {
     $insertInt = $db->prepare("INSERT INTO patient_interactions (tenant_id, patient_id, type, content) VALUES (?, ?, ?, ?)");
 
     foreach ($disparos as $index => $registro) {
-        // Rate Limiting: Delay randômico de 1 a 2 segundos
-        if ($index > 0) {
-            usleep(rand(1000000, 2000000));
-        }
-
         $tenantId = $registro['tenant_id'];
+
+        // Carregar configurações do tenant e parâmetros Anti-Ban
+        $stmtConf = $db->prepare("SELECT * FROM tenant_settings WHERE tenant_id = ? LIMIT 1");
+        $stmtConf->execute([$tenantId]);
+        $tenantConf = $stmtConf->fetch(PDO::FETCH_ASSOC) ?: [];
+
+        $minDelay = (int)($tenantConf['antiban_delay_min'] ?? 15);
+        $maxDelay = (int)($tenantConf['antiban_delay_max'] ?? 45);
+        if ($minDelay <= 0) $minDelay = 5;
+        if ($maxDelay < $minDelay) $maxDelay = $minDelay + 5;
+        $batchSize = (int)($tenantConf['antiban_batch_size'] ?? 20);
+        $batchInterval = (int)($tenantConf['antiban_batch_interval'] ?? 5);
+        $simTyping = isset($tenantConf['antiban_simulate_typing']) ? (bool)$tenantConf['antiban_simulate_typing'] : true;
+        $simAudio = isset($tenantConf['antiban_simulate_audio']) ? (bool)$tenantConf['antiban_simulate_audio'] : false;
+
+        // Intervalo pseudo-aleatório humanizado (Anti-Ban) a partir do segundo item
+        if ($index > 0) {
+            // Verifica se atingiu limite de lote para pausa prolongada
+            if ($batchSize > 0 && ($index % $batchSize === 0)) {
+                $batchSleepSec = $batchInterval * 60;
+                if (php_sapi_name() === 'cli') {
+                    echo "[Anti-Ban] Lote de {$batchSize} mensagens concluído. Pausa de {$batchInterval} min ({$batchSleepSec}s)...\n";
+                }
+                sleep($batchSleepSec);
+            } else {
+                $randDelay = rand($minDelay, $maxDelay);
+                if (php_sapi_name() === 'cli') {
+                    echo "[Anti-Ban] Aguardando {$randDelay}s antes do próximo envio humanizado...\n";
+                }
+                sleep($randDelay);
+            }
+        }
         $telefoneLimpo = preg_replace('/[^0-9]/', '', $registro['patient_phone']);
         if (strlen($telefoneLimpo) === 10 || strlen($telefoneLimpo) === 11) {
             if (substr($telefoneLimpo, 0, 2) !== '55') {
@@ -368,21 +395,59 @@ try {
             }
         }
 
+        // Garante personalização do nome do contato e data/horário antes do envio final
+        if (!empty($aiText)) {
+            $leadFullName = trim($registro['patient_name'] ?? 'Prospect');
+            $leadFirstName = explode(' ', $leadFullName)[0];
+            $apptFmtHora = !empty($registro['appointment_time']) ? date('H:i', strtotime($registro['appointment_time'])) : '19:00';
+            $apptFmtData = !empty($registro['appointment_time']) ? date('d/m/Y', strtotime($registro['appointment_time'])) : date('d/m/Y');
+            $aiText = str_replace(
+                ['{nome}', '{Nome}', '{NOME}', '{primeiro_nome}', '{Primeiro_Nome}', '{horario}', '{hora}', '{data}'],
+                [$leadFullName, $leadFullName, $leadFullName, $leadFirstName, $leadFirstName, $apptFmtHora, $apptFmtHora, $apptFmtData],
+                $aiText
+            );
+        }
+
         // Carregar credenciais do tenant de forma altamente resiliente com fallback seguro
         $stmtConf = $db->prepare("SELECT * FROM tenant_settings WHERE tenant_id = ? LIMIT 1");
         $stmtConf->execute([$tenantId]);
         $tenantConf = $stmtConf->fetch(PDO::FETCH_ASSOC) ?: [];
 
         $evoUrl = !empty($tenantConf['evolution_api_url']) ? $tenantConf['evolution_api_url'] : ($tenantConf['evolution_url'] ?? get_env_var('EVOLUTION_API_URL', 'https://evogo.acessaronline.com.br'));
-        $evoApiKey = !empty($tenantConf['evolution_api_key']) ? $tenantConf['evolution_api_key'] : ($tenantConf['evolution_apikey'] ?? get_env_var('EVOLUTION_API_KEY', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
-        $evoInstance = !empty($tenantConf['evolution_instance_name']) ? $tenantConf['evolution_instance_name'] : ($tenantConf['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural'));
+        $rawEvoInstance = !empty($tenantConf['evolution_instance_name']) ? $tenantConf['evolution_instance_name'] : ($tenantConf['evolution_instance'] ?? get_env_var('EVOLUTION_INSTANCE_NAME', 'atlanticanatural, Teste-disparo-maximo'));
+
+        // Parser de Rotação Multi-Chip em estilo Round-Robin com persistência entre chamadas
+        $instancesList = array_values(array_filter(array_map('trim', preg_split('/[,;]+/', (string)$rawEvoInstance))));
+        if (empty($instancesList) || (count($instancesList) === 1 && $instancesList[0] === 'atlanticanatural')) {
+            $instancesList = ['atlanticanatural', 'Teste-disparo-maximo'];
+        }
+
+        // Contador de rotação persistente entre execuções do cron
+        $counterFile = sys_get_temp_dir() . "/evo_rotation_" . md5($tenantId) . ".txt";
+        $lastIdx = file_exists($counterFile) ? (int)@file_get_contents($counterFile) : 0;
+        $currentIdx = ($lastIdx + $index) % count($instancesList);
+        $currentInstance = $instancesList[$currentIdx];
+        @file_put_contents($counterFile, (string)(($currentIdx + 1) % count($instancesList)));
+
         if (empty($evoApiKey)) {
             $evoApiKey = get_env_var('GLOBAL_API_KEY', get_env_var('CRON_API_SECRET', 'd7b87fcfca7d42cfb7692298bc6d42ef'));
         }
         $n8nUrl = $tenantConf['n8n_webhook_url'] ?? 'https://webhook.acessaronline.com.br/webhook/crm-lembretes-clinica';
 
-        if (!empty($evoUrl) && !empty($evoInstance)) {
-            $evoRes = send_evolution_whatsapp_message($db, $tenantId, $telefoneLimpo, $aiText);
+        if (!empty($evoUrl) && !empty($currentInstance)) {
+            if (php_sapi_name() === 'cli' && count($instancesList) > 1) {
+                echo "[Multi-Chip] Rotação: Enviando via instância '{$currentInstance}' (" . (($index % count($instancesList)) + 1) . "/" . count($instancesList) . ")...\n";
+            }
+
+            // Simulação de presença humana (Digitando... ou Gravando áudio...) antes do envio
+            if ($simTyping || $simAudio) {
+                $presenceType = $simAudio ? 'recording' : 'composing';
+                send_evolution_presence($db, $tenantId, $telefoneLimpo, $presenceType, 2500, $currentInstance);
+                // Pausa natural para o destinatário visualizar a digitação (1.8s a 2.6s)
+                usleep(rand(1800000, 2600000));
+            }
+
+            $evoRes = send_evolution_whatsapp_message($db, $tenantId, $telefoneLimpo, $aiText, $currentInstance);
             $httpCode = $evoRes['http_code'] ?? ($evoRes['success'] ? 200 : 500);
             $curlErr = $evoRes['error'] ?? '';
             $response = is_array($evoRes['response']) ? json_encode($evoRes['response']) : ($evoRes['response'] ?? '');
@@ -419,7 +484,8 @@ try {
         $existingLogs = $registro['logs'] ?? '';
 
         if ($httpCode === 200 || $httpCode === 201) {
-            $newLog = "\n[{$timestampActual}] Disparado via Cron Job ({$registro['dispatch_type']}) com sucesso.";
+            $multiTag = (count($instancesList) > 1) ? " via chip/instância [{$currentInstance}]" : "";
+            $newLog = "\n[{$timestampActual}] Disparado via Cron Job ({$registro['dispatch_type']}) com sucesso{$multiTag}.";
             $updatedLogStr = $existingLogs . $newLog;
 
             if ($isScheduledTable) {
