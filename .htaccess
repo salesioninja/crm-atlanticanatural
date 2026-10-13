@@ -1,0 +1,38 @@
+# Bloquear acesso direto a arquivos sensiveis (.env, .git, .log, composer, package)
+<FilesMatch "^\.env|\.git|\.log$|composer\.(json|lock)$|package(-lock)?\.json$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Desativar listagem de diretorios
+Options -Indexes
+
+<IfModule mod_rewrite.c>
+  RewriteEngine On
+  RewriteBase /
+
+  # Repasse seguro do Authorization Header para PHP-FPM / LiteSpeed
+  RewriteCond %{HTTP:Authorization} .
+  RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+  # Evitar loops de redirecionamento interno (Trava de Seguranca Universal)
+  RewriteCond %{ENV:REDIRECT_STATUS} ^.+$
+  RewriteRule ^ - [L]
+
+  # 1. Roteamento da API para index.php mantendo parametros
+  RewriteRule ^api/(.*)$ api/index.php [QSA,L]
+
+  # 2. Ignorar arquivos e diretorios fisicos que realmente existem
+  RewriteCond %{REQUEST_FILENAME} -f [OR]
+  RewriteCond %{REQUEST_FILENAME} -d
+  RewriteRule ^ - [L]
+
+  # 3. Roteamento do React SPA
+  RewriteRule . index.html [L]
+</IfModule>
+

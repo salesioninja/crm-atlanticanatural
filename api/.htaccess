@@ -1,0 +1,45 @@
+# Bloquear acesso a arquivos de configuração, ambiente, logs e git
+<FilesMatch "^\.env|\.git|\.log$|config\.ini$|composer\.(json|lock)$">
+    <IfModule mod_authz_core.c>
+        Require all denied
+    </IfModule>
+    <IfModule !mod_authz_core.c>
+        Order allow,deny
+        Deny from all
+    </IfModule>
+</FilesMatch>
+
+# Desativar listagem de diretórios
+Options -Indexes
+
+# Configuração Apache / Hostinger para Diretório API em subpastas ou raiz
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /api/
+
+    # Repasse seguro do Authorization Header para PHP-FPM / LiteSpeed
+    RewriteCond %{HTTP:Authorization} .
+    RewriteRule .* - [E=HTTP_AUTHORIZATION:%{HTTP:Authorization}]
+
+    # Se o arquivo ou diretório físico existir, serve direto
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Roteamento explícito para endpoints diretos
+    RewriteRule ^cron_dispatch/?$ cron_dispatch.php [L,QSA]
+    RewriteRule ^webhook_whatsapp/?$ webhook_whatsapp.php [L,QSA]
+    RewriteRule ^google_calendar_webhook/?$ google_calendar_webhook.php [L,QSA]
+    RewriteRule ^cron-disparos/?$ cron-disparos.php [L,QSA]
+
+    # Redirecionar todas as requisições virtuais para index.php mantendo query strings
+    RewriteRule ^(.*)$ index.php [QSA,L]
+</IfModule>
+
+# Permitir execução PHP e passar Headers de Autenticação Bearer, apikey e X-Webhook-Secret
+<IfModule mod_headers.c>
+    Header set Access-Control-Allow-Origin "*"
+    Header set Access-Control-Allow-Methods "GET, POST, PUT, DELETE, OPTIONS"
+    Header set Access-Control-Allow-Headers "Content-Type, Authorization, X-Tenant-ID, X-User-Email, apikey, X-Webhook-Secret"
+</IfModule>
+

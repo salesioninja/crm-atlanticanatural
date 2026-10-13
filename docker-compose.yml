@@ -1,0 +1,60 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: crm_atlantica_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: crm_atlantica
+      POSTGRES_USER: crm_admin
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-Max031184}
+    volumes:
+      - crm_atlantica_pgdata:/var/lib/postgresql/data
+      - ./database_pg.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - crm_network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crm_admin -d crm_atlantica"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: crm_atlantica_app
+    restart: unless-stopped
+    ports:
+      - "8095:80"
+    environment:
+      DB_CONNECTION: pgsql
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: crm_atlantica
+      DB_USER: crm_admin
+      DB_PASSWORD: ${DB_PASSWORD:-Max031184}
+      APP_URL: https://crmatlanticanatural.acessaronline.com.br
+      TENANT_ID: atlanticanatural
+      EVOLUTION_API_URL: https://evogo.acessaronline.com.br
+      EVOLUTION_API_KEY: d7b87fcfca7d42cfb7692298bc6d42ef
+      EVOLUTION_INSTANCE_NAME: atlanticanatural
+      VITE_API_SECRET: d7b87fcfca7d42cfb7692298bc6d42ef
+      CRON_API_SECRET: d7b87fcfca7d42cfb7692298bc6d42ef
+      WEBHOOK_SECRET: d7b87fcfca7d42cfb7692298bc6d42ef
+      DIAG_SECRET: d7b87fcfca7d42cfb7692298bc6d42ef
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: gemini-flash-lite-latest
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - crm_network
+
+volumes:
+  crm_atlantica_pgdata:
+    name: crm_atlantica_pgdata
+
+networks:
+  crm_network:
+    name: crm_atlantica_network
+    driver: bridge

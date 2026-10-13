@@ -1,0 +1,29 @@
+node_modules/
+build/
+dist/
+coverage/
+.DS_Store
+*.log
+.env*
+!.env.example
+
+# Backups, ZIPs and temporary files
+/deploy*/
+/meucrm*
+!/deploy.sh
+!/deploy_vps.sh
+/*.zip
+/temp_*
+/test_*
+/lembrete-clinica*
+/*.php
+client_secret*.json
+
+
+# Python & scratch temporary files
+__pycache__/
+*.py[cod]
+scratch/
+
+
+

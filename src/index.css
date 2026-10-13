@@ -1,0 +1,67 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  
+  --color-primary: #6366f1; /* Indigo-500 */
+  --color-primary-dim: #4f46e5; /* Indigo-600 */
+  --color-primary-container: rgba(99, 102, 241, 0.2);
+  --color-secondary: #a855f7; /* Purple-500 */
+  --color-secondary-container: rgba(168, 85, 247, 0.2);
+  --color-surface-bg: #0f172a; /* Deep Slate */
+  --color-surface-container-low: rgba(255, 255, 255, 0.05);
+  --color-surface-container-lowest: rgba(255, 255, 255, 0.1);
+  --color-on-surface: #ffffff;
+  --color-on-surface-variant: rgba(255, 255, 255, 0.6);
+  --color-outline-variant: rgba(255, 255, 255, 0.1);
+  --color-error-custom: #f43f5e; /* Rose-500 */
+  --color-error-container-custom: rgba(244, 63, 94, 0.1);
+}
+
+@layer base {
+  body {
+    @apply bg-surface-bg text-on-surface font-sans antialiased;
+  }
+}
+
+.glass-card {
+  @apply backdrop-blur-2xl bg-white/5 border border-white/10 shadow-2xl;
+}
+
+.glass-header {
+  @apply backdrop-blur-2xl bg-white/5 border-b border-white/10;
+}
+
+.glass-sidebar {
+  @apply backdrop-blur-2xl bg-white/5 border-r border-white/10;
+}
+
+.glass-pill {
+  @apply bg-white/10 border border-white/10 backdrop-blur-md;
+}
+
+/* Custom Scrollbars */
+.custom-scrollbar {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, 0.25) rgba(255, 255, 255, 0.05);
+}
+
+.custom-scrollbar::-webkit-scrollbar {
+  width: 7px;
+  height: 9px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.22);
+  border-radius: 8px;
+}
+
+.custom-scrollbar::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
